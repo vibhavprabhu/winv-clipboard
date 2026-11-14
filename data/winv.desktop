@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Clipboard History
+Comment=Windows-style (Win+V) clipboard history
+Exec=winv --toggle
+Icon=edit-paste
+Terminal=false
+Categories=Utility;
+Keywords=clipboard;history;paste;

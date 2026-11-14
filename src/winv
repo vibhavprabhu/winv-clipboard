@@ -1,0 +1,839 @@
+#!/usr/bin/python3
+# winv - Windows-style (Win+V) clipboard history for Linux.
+#
+# One background process watches the clipboard and keeps the last 25 text /
+# image entries. Super+V (or `winv --toggle`) opens a panel at the pointer;
+# picking an entry puts it back on the clipboard and pastes it into the
+# window you were working in.
+
+import os
+import sys
+
+VERSION = "1.0.0"
+APP_ID = "io.github.winv.ClipboardHistory"
+
+USAGE = """winv %s - Win+V style clipboard history
+
+usage: winv [option]
+
+  (no option)       start the background service (no-op if already running)
+  --toggle          show / hide the history panel   (bind this to Super+V)
+  --show, --hide    show or hide the panel
+  --clear           remove every entry that is not pinned
+  --quit            stop the background service
+  --setup-hotkey    bind Super+V on GNOME-based desktops
+  --remove-hotkey   undo --setup-hotkey
+  --version, --help
+""" % VERSION
+
+REMOTE_COMMANDS = ("--toggle", "--show", "--hide", "--clear", "--quit")
+
+if __name__ == "__main__":
+    _args = sys.argv[1:]
+    if "--help" in _args or "-h" in _args:
+        print(USAGE)
+        sys.exit(0)
+    if "--version" in _args:
+        print("winv " + VERSION)
+        sys.exit(0)
+    _known = REMOTE_COMMANDS + ("--setup-hotkey", "--remove-hotkey")
+    _bad = [a for a in _args if a not in _known]
+    if _bad:
+        sys.stderr.write("winv: unknown option %s\n\n%s" % (_bad[0], USAGE))
+        sys.exit(2)
+
+WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY")) or \
+    os.environ.get("XDG_SESSION_TYPE") == "wayland"
+
+# A background Wayland client is not told about clipboard changes, an X11
+# client is. So whenever an X server (Xorg or XWayland) is reachable, use it.
+if os.environ.get("DISPLAY") and "GDK_BACKEND" not in os.environ:
+    os.environ["GDK_BACKEND"] = "x11"
+
+import hashlib
+import json
+import shutil
+import subprocess
+import time
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
+
+MAX_ITEMS = 25                      # same as Windows
+MAX_TEXT_BYTES = 4 * 1024 * 1024    # same as Windows (4 MB per entry)
+MAX_IMAGE_BYTES = 64 * 1024 * 1024  # raw pixels
+PANEL_WIDTH = 400
+LIST_HEIGHT = 420
+
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "winv")
+DATA_DIR = os.path.join(GLib.get_user_data_dir(), "winv")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+HOTKEY_MARKER = os.path.join(CONFIG_DIR, "hotkey-configured")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+
+# Terminals paste with Ctrl+Shift+V instead of Ctrl+V.
+TERMINALS = {
+    "gnome-terminal", "gnome-terminal-server", "kgx", "ptyxis", "konsole",
+    "xfce4-terminal", "mate-terminal", "lxterminal", "qterminal", "tilix",
+    "terminator", "kitty", "alacritty", "wezterm", "org.wezfurlong.wezterm",
+    "foot", "ghostty", "com.mitchellh.ghostty", "guake", "tilda",
+    "terminology", "deepin-terminal", "io.elementary.terminal", "sakura",
+    "roxterm", "cool-retro-term", "blackbox", "x-terminal-emulator",
+}
+
+# Windows 11 colours: (panel, card, card hover, text, dim text, border, focus ring, accent)
+PALETTES = {
+    "dark": ("#2c2c2c", "#383838", "#404040", "#ffffff", "#c5c5c5", "#4a4a4a", "#ffffff", "#60cdff"),
+    "light": ("#f3f3f3", "#fbfbfb", "#f6f6f6", "#1a1a1a", "#5f5f5f", "#d6d6d6", "#1a1a1a", "#005fb8"),
+}
+
+CSS = """
+@define-color wv_bg %s;
+@define-color wv_card %s;
+@define-color wv_card_hover %s;
+@define-color wv_fg %s;
+@define-color wv_dim %s;
+@define-color wv_border %s;
+@define-color wv_ring %s;
+@define-color wv_accent %s;
+
+window.winv { background-color: @wv_bg; }
+window.winv.rounded { background-color: transparent; }
+.winv-panel {
+    background-color: @wv_bg;
+    border: 1px solid @wv_border;
+    color: @wv_fg;
+}
+window.winv.rounded .winv-panel { border-radius: 9px; }
+.winv scrolledwindow, .winv viewport, .winv list { background-color: transparent; }
+.winv label { color: @wv_fg; }
+.winv-title { font-size: 1.15em; }
+.winv label.winv-empty { color: @wv_dim; }
+
+.winv button {
+    background-image: none;
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    box-shadow: none;
+    text-shadow: none;
+    -gtk-icon-shadow: none;
+    color: @wv_fg;
+    padding: 3px;
+    min-width: 22px;
+    min-height: 22px;
+}
+.winv button:hover { background-color: alpha(@wv_fg, 0.10); }
+.winv button:active { background-color: alpha(@wv_fg, 0.06); }
+
+.winv-row {
+    margin: 4px 14px;
+    padding: 8px 6px 6px 12px;
+    min-height: 68px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-color: @wv_card;
+    color: @wv_fg;
+}
+.winv-row:hover { background-color: @wv_card_hover; }
+.winv-row:selected { background-color: @wv_card; border-color: @wv_ring; color: @wv_fg; }
+.winv-row label { font-size: 1.05em; }
+.winv-row button.pin { opacity: 0.5; }
+.winv-row button.pin:hover { opacity: 1; }
+.winv-row button.pin.pinned, .winv-row button.pin.pinned label { opacity: 1; color: @wv_accent; }
+
+.winv-row button.text { padding: 3px 8px; }
+"""
+
+
+def prefers_dark(cfg):
+    theme = cfg.get("theme", "auto")
+    if theme in ("dark", "light"):
+        return theme == "dark"
+    settings = Gtk.Settings.get_default()
+    if settings is not None:
+        if settings.get_property("gtk-application-prefer-dark-theme"):
+            return True
+        if "dark" in (settings.get_property("gtk-theme-name") or "").lower():
+            return True
+    source = Gio.SettingsSchemaSource.get_default()
+    schema = source.lookup("org.gnome.desktop.interface", True) if source else None
+    if schema is not None and schema.has_key("color-scheme"):
+        scheme = Gio.Settings.new("org.gnome.desktop.interface").get_string("color-scheme")
+        return scheme == "prefer-dark"
+    return False
+
+
+def log(msg):
+    sys.stderr.write("winv: %s\n" % msg)
+
+
+def run(cmd, timeout=2):
+    """Run a helper program; returns (ok, stdout)."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=timeout)
+        return p.returncode == 0, p.stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+def load_config():
+    cfg = {"max_items": MAX_ITEMS, "persist_history": False, "auto_paste": True,
+           "theme": "auto"}
+    try:
+        with open(CONFIG_FILE) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            cfg.update(user)
+    except (OSError, ValueError):
+        pass
+    try:
+        cfg["max_items"] = max(1, int(cfg["max_items"]))
+    except (TypeError, ValueError):
+        cfg["max_items"] = MAX_ITEMS
+    return cfg
+
+
+# ----------------------------------------------------------------- history
+
+class Item:
+    __slots__ = ("kind", "text", "pixbuf", "pinned", "key", "thumb")
+
+    def __init__(self, kind, text=None, pixbuf=None, pinned=False):
+        self.kind = kind
+        self.text = text
+        self.pixbuf = pixbuf
+        self.pinned = pinned
+        self.thumb = None
+        h = hashlib.sha1()
+        if kind == "text":
+            h.update(b"t" + text.encode("utf-8", "surrogatepass"))
+        else:
+            h.update(("i%dx%dx%d" % (pixbuf.get_width(), pixbuf.get_height(),
+                                     pixbuf.get_n_channels())).encode())
+            h.update(pixbuf.get_pixels())
+        self.key = h.hexdigest()
+
+
+class History:
+    """Newest first. Pinned entries are never evicted and survive restarts."""
+
+    def __init__(self, cfg):
+        self.items = []
+        self.max_items = cfg["max_items"]
+        self.persist_all = bool(cfg["persist_history"])
+        self.load()
+
+    def add(self, item):
+        for old in self.items:
+            if old.key == item.key:
+                self.items.remove(old)
+                self.items.insert(0, old)
+                return old
+        self.items.insert(0, item)
+        while len(self.items) > self.max_items:
+            for old in reversed(self.items):
+                if not old.pinned:
+                    self.items.remove(old)
+                    break
+            else:
+                break
+        return item
+
+    def remove(self, item):
+        if item in self.items:
+            self.items.remove(item)
+            self.save()
+
+    def clear(self):
+        self.items = [i for i in self.items if i.pinned]
+        self.save()
+
+    def set_pinned(self, item, pinned):
+        item.pinned = pinned
+        self.save()
+
+    def save(self):
+        try:
+            os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+            entries, keep = [], {os.path.basename(HISTORY_FILE)}
+            for it in self.items:
+                if not (it.pinned or self.persist_all):
+                    continue
+                if it.kind == "text":
+                    entries.append({"kind": "text", "text": it.text, "pinned": it.pinned})
+                else:
+                    name = it.key + ".png"
+                    path = os.path.join(DATA_DIR, name)
+                    if not os.path.exists(path):
+                        it.pixbuf.savev(path, "png", [], [])
+                        os.chmod(path, 0o600)
+                    keep.add(name)
+                    entries.append({"kind": "image", "file": name, "pinned": it.pinned})
+            tmp = HISTORY_FILE + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(entries, f)
+            os.replace(tmp, HISTORY_FILE)
+            for name in os.listdir(DATA_DIR):
+                if name not in keep:
+                    os.unlink(os.path.join(DATA_DIR, name))
+        except (OSError, GLib.Error) as e:
+            log("could not save history: %s" % e)
+
+    def load(self):
+        try:
+            with open(HISTORY_FILE) as f:
+                entries = json.load(f)
+        except (OSError, ValueError):
+            return
+        for e in entries:
+            try:
+                if e["kind"] == "text":
+                    it = Item("text", text=e["text"], pinned=bool(e.get("pinned")))
+                else:
+                    pb = GdkPixbuf.Pixbuf.new_from_file(
+                        os.path.join(DATA_DIR, os.path.basename(e["file"])))
+                    it = Item("image", pixbuf=pb, pinned=bool(e.get("pinned")))
+                self.items.append(it)
+            except (KeyError, TypeError, GLib.Error):
+                continue
+
+
+# ------------------------------------------------------------------- panel
+
+class Panel(Gtk.Window):
+    def __init__(self, app):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL, title="Clipboard")
+        self.app = app
+        self._shown_at = 0.0
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.stick()
+        self.add_events(Gdk.EventMask.PROPERTY_CHANGE_MASK)
+        ctx = self.get_style_context()
+        ctx.add_class("winv")
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual is not None and screen.is_composited():
+            self.set_visual(visual)
+            self.set_app_paintable(True)
+            ctx.add_class("rounded")
+
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        panel.get_style_context().add_class("winv-panel")
+        self.add(panel)
+
+        header = Gtk.Box(spacing=8)
+        header.set_margin_top(12)
+        header.set_margin_bottom(8)
+        header.set_margin_start(18)
+        header.set_margin_end(12)
+        title = Gtk.Label(label="Clipboard", xalign=0)
+        title.get_style_context().add_class("winv-title")
+        header.pack_start(title, True, True, 0)
+        header.pack_end(self._icon_button("window-close-symbolic", "✕", "Close",
+                                          lambda *_: self.hide()), False, False, 0)
+        panel.pack_start(header, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_size_request(PANEL_WIDTH, LIST_HEIGHT)
+        panel.pack_start(scroll, True, True, 0)
+
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.set_activate_on_single_click(True)
+        self.listbox.get_style_context().add_class("winv-list")
+        self.listbox.connect("row-activated", lambda _lb, row: self.app.paste_item(row.item))
+        empty = Gtk.Label(
+            label="Nothing here\n\nYou'll see your clipboard history here\n"
+                  "once you've copied something.",
+            justify=Gtk.Justification.CENTER)
+        empty.get_style_context().add_class("winv-empty")
+        empty.show()
+        self.listbox.set_placeholder(empty)
+        scroll.add(self.listbox)
+        panel.pack_end(Gtk.Box(height_request=8), False, False, 0)
+
+        self.connect("key-press-event", self._on_key)
+        self.connect("focus-out-event", self._on_focus_out)
+        self.connect("delete-event", lambda *_: self.hide() or True)
+
+    # -- rows
+
+    def _icon_button(self, icon, fallback, tooltip, handler):
+        btn = Gtk.Button()
+        try:    # the icon may be missing, or the theme may lack an SVG loader
+            Gtk.IconTheme.get_default().load_icon(icon, 16, 0)
+            btn.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU))
+        except GLib.Error:
+            btn.set_label(fallback)
+        btn.set_relief(Gtk.ReliefStyle.NONE)
+        btn.set_can_focus(False)
+        btn.set_tooltip_text(tooltip)
+        btn.connect("clicked", handler)
+        return btn
+
+    def _make_row(self, item):
+        row = Gtk.ListBoxRow()
+        row.item = item
+        row.get_style_context().add_class("winv-row")
+        box = Gtk.Box(spacing=6)
+        if item.kind == "text":
+            body = Gtk.Label(label=item.text.strip()[:600] or item.text[:600], xalign=0, yalign=0)
+            body.set_line_wrap(True)
+            body.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            body.set_lines(4)
+            body.set_ellipsize(Pango.EllipsizeMode.END)
+            body.set_width_chars(20)
+            body.set_max_width_chars(30)
+        else:
+            if item.thumb is None:
+                w, h = item.pixbuf.get_width(), item.pixbuf.get_height()
+                scale = min(1.0, 290.0 / w, 120.0 / h)
+                item.thumb = item.pixbuf.scale_simple(
+                    max(1, int(w * scale)), max(1, int(h * scale)),
+                    GdkPixbuf.InterpType.BILINEAR)
+            body = Gtk.Image.new_from_pixbuf(item.thumb)
+            body.set_halign(Gtk.Align.START)
+        box.pack_start(body, True, True, 0)
+
+        # Like Windows 11: "..." top right (expands to Delete / Clear all),
+        # pin bottom right.
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        actions = Gtk.Box(spacing=2)
+        actions.set_halign(Gtk.Align.END)
+        actions.pack_start(self._icon_button("user-trash-symbolic", "✕", "Delete",
+                                             lambda *_: self.app.delete_item(item)),
+                           False, False, 0)
+        clear = Gtk.Button(label="Clear all")
+        clear.get_style_context().add_class("text")
+        clear.set_relief(Gtk.ReliefStyle.NONE)
+        clear.set_can_focus(False)
+        clear.set_tooltip_text("Remove everything except pinned items")
+        clear.connect("clicked", lambda *_: self.app.clear_history())
+        actions.pack_start(clear, False, False, 0)
+        actions.show_all()
+        actions.set_no_show_all(True)
+        actions.hide()
+
+        def expand(btn):
+            btn.hide()
+            actions.show()
+        more = self._icon_button("view-more-horizontal-symbolic", "⋯", "See more", expand)
+        more.set_halign(Gtk.Align.END)
+        side.pack_start(more, False, False, 0)
+        side.pack_start(actions, False, False, 0)
+
+        pin = self._icon_button("view-pin-symbolic", "★",
+                                "Unpin" if item.pinned else "Pin",
+                                lambda *_: self.app.toggle_pin(item))
+        pin.set_halign(Gtk.Align.END)
+        pin.get_style_context().add_class("pin")
+        if item.pinned:
+            pin.get_style_context().add_class("pinned")
+        side.pack_end(pin, False, False, 0)
+        box.pack_end(side, False, False, 0)
+        row.add(box)
+        return row
+
+
+    def refresh(self, select=0):
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+        for item in self.app.history.items:
+            self.listbox.add(self._make_row(item))
+        self.listbox.show_all()
+        rows = self.listbox.get_children()
+        if rows:
+            row = rows[max(0, min(select, len(rows) - 1))]
+            self.listbox.select_row(row)
+            if self.get_visible():
+                row.grab_focus()
+
+    def selected_index(self):
+        row = self.listbox.get_selected_row()
+        return row.get_index() if row is not None else 0
+
+    # -- show / hide
+
+    def _place(self):
+        display = self.get_display()
+        px = py = None
+        if not WAYLAND:   # under XWayland the pointer position is unreliable
+            try:
+                _screen, px, py = display.get_default_seat().get_pointer().get_position()
+            except Exception:
+                px = py = None
+        monitor = None
+        if px is not None:
+            monitor = display.get_monitor_at_point(px, py)
+        if monitor is None:
+            monitor = display.get_primary_monitor() or display.get_monitor(0)
+        if monitor is None:
+            return
+        area = monitor.get_workarea()
+        _min, nat = self.get_preferred_size()
+        w, h = nat.width, nat.height
+        if px is None:
+            x = area.x + (area.width - w) // 2
+            y = area.y + (area.height - h) // 2
+        else:
+            x = min(max(px, area.x), area.x + area.width - w)
+            y = min(max(py + 12, area.y), area.y + area.height - h)
+        self.move(x, y)
+
+    def popup(self):
+        self.refresh()
+        self.show_all()
+        self._place()
+        stamp = Gdk.CURRENT_TIME
+        try:
+            gi.require_version("GdkX11", "3.0")
+            from gi.repository import GdkX11
+            gdk_window = self.get_window()
+            if isinstance(gdk_window, GdkX11.X11Window):
+                stamp = GdkX11.x11_get_server_time(gdk_window)
+        except Exception:
+            pass
+        self._shown_at = time.monotonic()
+        self.present_with_time(stamp)
+        self._place()
+        self.listbox.get_adjustment().set_value(0)
+        row = self.listbox.get_selected_row()
+        if row is not None:
+            row.grab_focus()
+
+    def _on_key(self, _w, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.hide()
+            return True
+        if event.keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
+            row = self.listbox.get_selected_row()
+            if row is not None:
+                self.app.delete_item(row.item)
+            return True
+        return False
+
+    def _on_focus_out(self, *_):
+        def check():
+            if self.get_visible() and not self.is_active() \
+                    and time.monotonic() - self._shown_at > 0.4:
+                self.hide()
+            return False
+        GLib.timeout_add(120, check)
+        return False
+
+
+# --------------------------------------------------------------------- app
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID,
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.panel = None
+        self.prev_window = None
+        self._pending_read = 0
+        self._ignore_until = 0.0
+        self._xdisplay = None
+        self._last_release = -1
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.cfg = load_config()
+        self.history = History(self.cfg)
+
+        provider = Gtk.CssProvider()
+        palette = PALETTES["dark" if prefers_dark(self.cfg) else "light"]
+        provider.load_from_data((CSS % palette).encode())
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        self.clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self.clipboard.connect("owner-change", self._on_owner_change)
+        self._schedule_read()          # pick up whatever is on the clipboard now
+
+        self.panel = Panel(self)
+        self._first_run_hotkey()
+        self._grab_hotkey()
+        self.hold()                    # keep running without a visible window
+
+    def do_command_line(self, command_line):
+        for arg in command_line.get_arguments()[1:]:
+            if arg == "--toggle":
+                self.toggle()
+            elif arg == "--show":
+                self.show_panel()
+            elif arg == "--hide":
+                self.panel.hide()
+            elif arg == "--clear":
+                self.clear_history()
+            elif arg == "--quit":
+                self.quit()
+        return 0
+
+    # -- clipboard watching
+
+    def _on_owner_change(self, *_):
+        if time.monotonic() >= self._ignore_until:
+            self._schedule_read()
+
+    def _schedule_read(self):
+        if self._pending_read:
+            GLib.source_remove(self._pending_read)
+        self._pending_read = GLib.timeout_add(150, self._read_clipboard)
+
+    def _read_clipboard(self):
+        self._pending_read = 0
+        cb = self.clipboard
+        ok, targets = cb.wait_for_targets()
+        if not ok or not targets:
+            return False
+        names = {t.name() for t in targets}
+        if "x-kde-passwordManagerHint" in names:      # password managers
+            return False
+        if "text/uri-list" in names or "x-special/gnome-copied-files" in names:
+            return False                              # copied files, like Windows
+        item = None
+        if cb.wait_is_text_available():
+            text = cb.wait_for_text()
+            if text and len(text.encode("utf-8", "surrogatepass")) <= MAX_TEXT_BYTES:
+                item = Item("text", text=text)
+        elif cb.wait_is_image_available():
+            pixbuf = cb.wait_for_image()
+            if pixbuf is not None and pixbuf.get_byte_length() <= MAX_IMAGE_BYTES:
+                item = Item("image", pixbuf=pixbuf)
+        if item is not None:
+            self.history.add(item)
+            if self.history.persist_all:
+                self.history.save()
+            if self.panel.get_visible():
+                self.panel.refresh()
+        return False
+
+    def _set_clipboard(self, item):
+        self._ignore_until = time.monotonic() + 0.5
+        if item.kind == "text":
+            self.clipboard.set_text(item.text, -1)
+        else:
+            self.clipboard.set_image(item.pixbuf)
+
+    # -- actions
+
+    def toggle(self):
+        if self.panel.get_visible():
+            self.panel.hide()
+        else:
+            self.show_panel()
+
+    def show_panel(self):
+        if self.panel.get_visible():
+            return
+        self.prev_window = None
+        if not WAYLAND:
+            ok, out = run(["xdotool", "getactivewindow"], timeout=1)
+            if ok and out.strip().isdigit():
+                self.prev_window = out.strip()
+        self.panel.popup()
+
+    def paste_item(self, item):
+        self.history.add(item)                 # moves it to the top
+        self._set_clipboard(item)
+        self.panel.hide()
+        if self.cfg.get("auto_paste", True):
+            GLib.timeout_add(150, self._send_paste)
+
+    def toggle_pin(self, item):
+        index = self.panel.selected_index()
+        self.history.set_pinned(item, not item.pinned)
+        self.panel.refresh(index)
+
+    def delete_item(self, item):
+        index = self.panel.selected_index()
+        self.history.remove(item)
+        self.panel.refresh(index)
+
+    def clear_history(self):
+        top = self.history.items[0] if self.history.items else None
+        self.history.clear()
+        if top is not None and not top.pinned:  # Windows empties the clipboard too
+            self._ignore_until = time.monotonic() + 0.5
+            self.clipboard.set_text("", 0)
+        if self.panel.get_visible():
+            self.panel.refresh()
+
+    # -- pasting into the previous window
+
+    def _is_terminal(self, wid):
+        ok, out = run(["xprop", "-id", wid, "WM_CLASS"], timeout=1)
+        if not ok or "=" not in out:
+            return False
+        names = [n.strip().strip('"').lower() for n in out.split("=", 1)[1].split(",")]
+        return any(n in TERMINALS for n in names)
+
+    def _send_paste(self):
+        if WAYLAND:
+            attempts = [["wtype", "-M", "ctrl", "v", "-m", "ctrl"],
+                        ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                        ["xdotool", "key", "ctrl+v"]]
+        else:
+            wid = self.prev_window
+            keys = "ctrl+shift+v" if wid and self._is_terminal(wid) else "ctrl+v"
+            attempts = [["xdotool", "key", keys]]
+            if wid:
+                attempts.insert(0, ["xdotool", "windowactivate", "--sync", wid, "key", keys])
+        for cmd in attempts:
+            if shutil.which(cmd[0]) and run(cmd, timeout=3)[0]:
+                break
+        return False
+
+    # -- Super+V
+
+    def _first_run_hotkey(self):
+        if os.path.exists(HOTKEY_MARKER):
+            return
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(HOTKEY_MARKER, "w") as f:
+                f.write("done\n")
+        except OSError:
+            return
+        setup_hotkey(quiet=True)
+
+    def _grab_hotkey(self):
+        """Plain X11 sessions: grab Super+V ourselves. If the desktop already
+        owns the key (GNOME custom shortcut, KDE's Klipper) the grab is refused
+        and we rely on `winv --toggle` being bound there instead."""
+        if WAYLAND or not os.environ.get("DISPLAY"):
+            return
+        try:
+            from Xlib import X, XK, display, error
+            d = display.Display()
+            root = d.screen().root
+            keycode = d.keysym_to_keycode(XK.XK_v)
+            refused = error.CatchError(error.BadAccess)
+            for lock in (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask):
+                root.grab_key(keycode, X.Mod4Mask | lock, True,
+                              X.GrabModeAsync, X.GrabModeAsync, onerror=refused)
+            d.sync()
+            if refused.get_error():
+                log("Super+V is already taken by the desktop; "
+                    "bind `winv --toggle` to a shortcut there if it does not open the panel")
+                d.close()
+                return
+            self._xdisplay = d
+            self._x = X
+            GLib.io_add_watch(d.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, self._on_x_event)
+            self._on_x_event()
+        except Exception as e:
+            log("no built-in Super+V grab (%s); bind `winv --toggle` to a shortcut" % e)
+
+    def _on_x_event(self, *_):
+        d, X = self._xdisplay, self._x
+        while d.pending_events():
+            ev = d.next_event()
+            if ev.type == X.KeyRelease:
+                self._last_release = ev.time
+            elif ev.type == X.KeyPress:
+                if ev.time == self._last_release:   # keyboard auto-repeat
+                    continue
+                self.toggle()
+        return True
+
+
+# ------------------------------------------------- desktop hotkey (GNOME)
+
+GNOME_MK = "org.gnome.settings-daemon.plugins.media-keys"
+GNOME_KB = GNOME_MK + ".custom-keybinding"
+GNOME_KB_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/winv/"
+GNOME_SHELL_KB = "org.gnome.shell.keybindings"
+
+
+def _schema(schema_id):
+    source = Gio.SettingsSchemaSource.get_default()
+    return source.lookup(schema_id, True) if source is not None else None
+
+
+def _toggle_command():
+    path = os.path.realpath(sys.argv[0])
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        path = shutil.which("winv") or "winv"
+    return path + " --toggle"
+
+
+def setup_hotkey(quiet=False):
+    """Bind Super+V to `winv --toggle` in GNOME-style desktops (GNOME, Ubuntu,
+    Budgie, Pop). GNOME uses Super+V for the notification list by default;
+    that binding is reduced to its other default, Super+M."""
+    if _schema(GNOME_MK) is None or _schema(GNOME_KB) is None:
+        if not quiet:
+            print("No GNOME keybinding settings found.\n"
+                  "On X11 desktops winv grabs Super+V by itself. Otherwise add a custom\n"
+                  "shortcut in your desktop settings that runs:  " + _toggle_command())
+        return False
+    media = Gio.Settings.new(GNOME_MK)
+    paths = list(media.get_strv("custom-keybindings"))
+    if GNOME_KB_PATH not in paths:
+        media.set_strv("custom-keybindings", paths + [GNOME_KB_PATH])
+    kb = Gio.Settings.new_with_path(GNOME_KB, GNOME_KB_PATH)
+    kb.set_string("name", "Clipboard History")
+    kb.set_string("command", _toggle_command())
+    kb.set_string("binding", "<Super>v")
+    shell = _schema(GNOME_SHELL_KB)
+    if shell is not None and shell.has_key("toggle-message-tray"):
+        s = Gio.Settings.new(GNOME_SHELL_KB)
+        current = list(s.get_strv("toggle-message-tray"))
+        kept = [b for b in current if b.lower() != "<super>v"]
+        if kept != current:
+            s.set_strv("toggle-message-tray", kept)
+    Gio.Settings.sync()
+    if not quiet:
+        print("Super+V now opens the clipboard history.")
+    return True
+
+
+def remove_hotkey():
+    if _schema(GNOME_MK) is None or _schema(GNOME_KB) is None:
+        print("No GNOME keybinding settings found; nothing to remove.")
+        return
+    media = Gio.Settings.new(GNOME_MK)
+    paths = list(media.get_strv("custom-keybindings"))
+    if GNOME_KB_PATH in paths:
+        paths.remove(GNOME_KB_PATH)
+        media.set_strv("custom-keybindings", paths)
+    kb = Gio.Settings.new_with_path(GNOME_KB, GNOME_KB_PATH)
+    for key in ("name", "command", "binding"):
+        kb.reset(key)
+    shell = _schema(GNOME_SHELL_KB)
+    if shell is not None and shell.has_key("toggle-message-tray"):
+        Gio.Settings.new(GNOME_SHELL_KB).reset("toggle-message-tray")
+    Gio.Settings.sync()
+    try:
+        os.unlink(HOTKEY_MARKER)
+    except OSError:
+        pass
+    print("Super+V shortcut removed.")
+
+
+def main():
+    args = sys.argv[1:]
+    if "--setup-hotkey" in args:
+        return 0 if setup_hotkey() else 1
+    if "--remove-hotkey" in args:
+        remove_hotkey()
+        return 0
+    return App().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

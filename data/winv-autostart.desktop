@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Clipboard History (winv)
+Comment=Keeps the clipboard history and opens it with Super+V
+Exec=winv
+Icon=edit-paste
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
