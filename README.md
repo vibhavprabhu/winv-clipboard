@@ -1,5 +1,7 @@
 # winv — Win+V clipboard history for Linux
 
+<a href="https://www.buymeacoffee.com/vibhavprabhu"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
+
 Press **Super+V** (the Windows key + V) and get the Windows clipboard history
 panel: the last 25 things you copied, text and images, newest first. Click one
 (or pick it with the arrow keys and Enter) and it is pasted into the window you
@@ -84,3 +86,8 @@ pinned entries. Restart winv (`winv --quit; winv &`) after changing it.
     winv --remove-hotkey  undo that
 
 Pinned entries are stored in `~/.local/share/winv/`, readable only by you.
+
+## Support
+
+If winv saves you time, you can
+[buy me a coffee](https://www.buymeacoffee.com/vibhavprabhu). Thank you!
