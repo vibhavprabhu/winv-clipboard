@@ -827,8 +827,43 @@ def remove_hotkey():
     print("Super+V shortcut removed.")
 
 
+def _service_running(bus):
+    reply = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                          "org.freedesktop.DBus", "NameHasOwner",
+                          GLib.Variant("(s)", (APP_ID,)), GLib.VariantType("(b)"),
+                          Gio.DBusCallFlags.NONE, 1000, None)
+    return reply.unpack()[0]
+
+
+def ensure_service():
+    """`winv --toggle` with no service running would otherwise become the
+    service itself and never return. Start it in the background instead."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        if _service_running(bus):
+            return
+        subprocess.Popen([sys.executable, os.path.realpath(sys.argv[0])],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            time.sleep(0.2)
+            if _service_running(bus):
+                return
+    except (GLib.Error, OSError) as e:
+        log("could not start the background service: %s" % e)
+
+
 def main():
     args = sys.argv[1:]
+    if "--toggle" in args or "--show" in args:
+        ensure_service()
+    elif any(a in args for a in ("--hide", "--clear", "--quit")):
+        try:   # nothing to hide, clear or stop when the service isn't running
+            if not _service_running(Gio.bus_get_sync(Gio.BusType.SESSION, None)):
+                return 0
+        except GLib.Error:
+            pass
     if "--setup-hotkey" in args:
         return 0 if setup_hotkey() else 1
     if "--remove-hotkey" in args:
