@@ -44,6 +44,7 @@ if __name__ == "__main__":
 
 WAYLAND = bool(os.environ.get("WAYLAND_DISPLAY")) or \
     os.environ.get("XDG_SESSION_TYPE") == "wayland"
+WSL = bool(os.environ.get("WSL_DISTRO_NAME")) or os.path.isdir("/mnt/wslg")
 
 # A background Wayland client is not told about clipboard changes, an X11
 # client is. So whenever an X server (Xorg or XWayland) is reachable, use it.
@@ -316,7 +317,8 @@ class Panel(Gtk.Window):
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
         self.set_keep_above(True)
-        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        if not WSL:   # WSLg puts utility windows off-screen and they get no clicks
+            self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
         self.stick()
         self.add_events(Gdk.EventMask.PROPERTY_CHANGE_MASK)
         ctx = self.get_style_context()
