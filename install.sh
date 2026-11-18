@@ -17,11 +17,11 @@ if [ "$1" = "--remove" ]; then
 fi
 
 if command -v apt-get >/dev/null 2>&1; then
-    apt-get install -y python3-gi gir1.2-gtk-3.0 python3-xlib xdotool x11-utils
+    apt-get install -y python3-gi gir1.2-gtk-3.0 python3-xlib xdotool x11-utils fonts-noto-color-emoji
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y python3-gobject gtk3 python3-xlib xdotool xprop
+    dnf install -y python3-gobject gtk3 python3-xlib xdotool xprop google-noto-color-emoji-fonts
 elif command -v pacman >/dev/null 2>&1; then
-    pacman -S --needed --noconfirm python-gobject gtk3 python-xlib xdotool xorg-xprop
+    pacman -S --needed --noconfirm python-gobject gtk3 python-xlib xdotool xorg-xprop noto-fonts-emoji
 elif command -v zypper >/dev/null 2>&1; then
     zypper --non-interactive install python3-gobject python3-gobject-Gdk typelib-1_0-Gtk-3_0 python3-python-xlib xdotool xprop
 else

@@ -2,14 +2,14 @@
 # winv - Windows-style (Win+V) clipboard history for Linux.
 #
 # One background process watches the clipboard and keeps the last 25 text /
-# image entries. Super+V (or `winv --toggle`) opens a panel at the pointer;
-# picking an entry puts it back on the clipboard and pastes it into the
-# window you were working in.
+# image entries. Super+V (or `winv --toggle`) opens a Windows 11 style panel
+# with clipboard history plus emoji, kaomoji and symbol pickers (Super+.);
+# picking something pastes it into the window you were working in.
 
 import os
 import sys
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP_ID = "io.github.winv.ClipboardHistory"
 
 USAGE = """winv %s - Win+V style clipboard history
@@ -17,16 +17,17 @@ USAGE = """winv %s - Win+V style clipboard history
 usage: winv [option]
 
   (no option)       start the background service (no-op if already running)
-  --toggle          show / hide the history panel   (bind this to Super+V)
+  --toggle          show / hide the clipboard history (bind this to Super+V)
+  --emoji           show / hide the emoji picker      (bind this to Super+.)
   --show, --hide    show or hide the panel
   --clear           remove every entry that is not pinned
   --quit            stop the background service
-  --setup-hotkey    bind Super+V on GNOME-based desktops
+  --setup-hotkey    bind Super+V and Super+. on GNOME-based desktops
   --remove-hotkey   undo --setup-hotkey
   --version, --help
 """ % VERSION
 
-REMOTE_COMMANDS = ("--toggle", "--show", "--hide", "--clear", "--quit")
+REMOTE_COMMANDS = ("--toggle", "--emoji", "--show", "--hide", "--clear", "--quit")
 
 if __name__ == "__main__":
     _args = sys.argv[1:]
@@ -53,6 +54,7 @@ if os.environ.get("DISPLAY") and "GDK_BACKEND" not in os.environ:
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -72,8 +74,10 @@ LIST_HEIGHT = 420
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "winv")
 DATA_DIR = os.path.join(GLib.get_user_data_dir(), "winv")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
-HOTKEY_MARKER = os.path.join(CONFIG_DIR, "hotkey-configured")
+HOTKEY_MARKER = os.path.join(CONFIG_DIR, "hotkeys-configured-v2")   # v2 adds Super+.
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+RECENT_FILE = os.path.join(CONFIG_DIR, "recent.json")   # recently used emoji etc.
+MAX_RECENT = 32
 
 # Terminals paste with Ctrl+Shift+V instead of Ctrl+V.
 TERMINALS = {
@@ -147,6 +151,73 @@ window.winv.rounded .winv-panel { border-radius: 9px; }
 .winv-row button.pin.pinned, .winv-row button.pin.pinned label { opacity: 1; color: @wv_accent; }
 
 .winv-row button.text { padding: 3px 8px; }
+
+/* tabs: emoji, kaomoji, symbols, clipboard */
+.winv button.winv-tab {
+    font-size: 1.15em;
+    min-width: 40px;
+    min-height: 32px;
+    padding: 2px 8px 4px 8px;
+    border-radius: 4px;
+}
+.winv button.winv-tab.active { box-shadow: inset 0 -3px @wv_accent; }
+
+.winv entry {
+    background-image: none;
+    background-color: @wv_card;
+    color: @wv_fg;
+    border: 1px solid @wv_border;
+    border-bottom: 2px solid alpha(@wv_fg, 0.35);
+    border-radius: 5px;
+    box-shadow: none;
+    min-height: 32px;
+}
+.winv entry:focus { border-bottom-color: @wv_accent; }
+.winv entry image { color: @wv_dim; }
+
+.winv label.winv-section {
+    font-weight: bold;
+    margin: 8px 18px 4px 18px;
+}
+
+.winv flowbox { margin: 0 12px; }
+.winv flowboxchild {
+    padding: 0;
+    margin: 1px;
+    border-radius: 5px;
+    border: 2px solid transparent;
+}
+.winv flowboxchild:hover { background-color: alpha(@wv_fg, 0.09); }
+.winv flowboxchild:focus { border-color: @wv_ring; }
+.winv-grid-emoji flowboxchild label { font-size: 1.6em; padding: 2px 0; }
+.winv-grid-symbols flowboxchild label { font-size: 1.25em; padding: 4px 0; }
+.winv-grid-kaomoji flowboxchild {
+    background-color: @wv_card;
+    margin: 3px;
+    min-height: 40px;
+}
+.winv-grid-kaomoji flowboxchild:hover { background-color: @wv_card_hover; }
+.winv-grid-kaomoji flowboxchild label { padding: 8px 4px; }
+
+.winv-catbar {
+    border-top: 1px solid @wv_border;
+    padding-top: 4px;
+    margin: 4px 10px 0 10px;
+}
+.winv-catbar button { font-size: 1.05em; min-width: 30px; padding: 3px 4px; }
+.winv-catbar button.active { box-shadow: inset 0 -2px @wv_accent; }
+
+.winv label.winv-section.winv-clip-title { margin-right: 2px; }
+.winv label.winv-count {
+    background-color: alpha(@wv_fg, 0.12);
+    border-radius: 9px;
+    padding: 0 7px;
+    font-size: 0.85em;
+    margin-top: 4px;
+}
+.winv button.winv-clear { color: @wv_dim; padding: 2px 8px; margin-top: 4px; }
+.winv button.winv-clear:hover { color: @wv_fg; }
+.winv label.winv-meta { color: @wv_dim; font-size: 0.85em; }
 """
 
 
@@ -166,6 +237,17 @@ def prefers_dark(cfg):
         scheme = Gio.Settings.new("org.gnome.desktop.interface").get_string("color-scheme")
         return scheme == "prefer-dark"
     return False
+
+
+def time_ago(t):
+    d = max(0, time.time() - t)
+    if d < 60:
+        return "Just now"
+    if d < 3600:
+        return "%dm ago" % (d // 60)
+    if d < 86400:
+        return "%dh ago" % (d // 3600)
+    return "%dd ago" % (d // 86400)
 
 
 def log(msg):
@@ -202,14 +284,15 @@ def load_config():
 # ----------------------------------------------------------------- history
 
 class Item:
-    __slots__ = ("kind", "text", "pixbuf", "pinned", "key", "thumb")
+    __slots__ = ("kind", "text", "pixbuf", "pinned", "key", "thumb", "time")
 
-    def __init__(self, kind, text=None, pixbuf=None, pinned=False):
+    def __init__(self, kind, text=None, pixbuf=None, pinned=False, when=None):
         self.kind = kind
         self.text = text
         self.pixbuf = pixbuf
         self.pinned = pinned
         self.thumb = None
+        self.time = when if when is not None else time.time()   # when it was copied
         h = hashlib.sha1()
         if kind == "text":
             h.update(b"t" + text.encode("utf-8", "surrogatepass"))
@@ -234,6 +317,7 @@ class History:
             if old.key == item.key:
                 self.items.remove(old)
                 self.items.insert(0, old)
+                old.time = time.time()
                 return old
         self.items.insert(0, item)
         while len(self.items) > self.max_items:
@@ -266,7 +350,8 @@ class History:
                 if not (it.pinned or self.persist_all):
                     continue
                 if it.kind == "text":
-                    entries.append({"kind": "text", "text": it.text, "pinned": it.pinned})
+                    entries.append({"kind": "text", "text": it.text,
+                                    "pinned": it.pinned, "time": it.time})
                 else:
                     name = it.key + ".png"
                     path = os.path.join(DATA_DIR, name)
@@ -274,7 +359,8 @@ class History:
                         it.pixbuf.savev(path, "png", [], [])
                         os.chmod(path, 0o600)
                     keep.add(name)
-                    entries.append({"kind": "image", "file": name, "pinned": it.pinned})
+                    entries.append({"kind": "image", "file": name,
+                                    "pinned": it.pinned, "time": it.time})
             tmp = HISTORY_FILE + ".tmp"
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as f:
@@ -295,23 +381,276 @@ class History:
         for e in entries:
             try:
                 if e["kind"] == "text":
-                    it = Item("text", text=e["text"], pinned=bool(e.get("pinned")))
+                    it = Item("text", text=e["text"], pinned=bool(e.get("pinned")),
+                              when=e.get("time"))
                 else:
                     pb = GdkPixbuf.Pixbuf.new_from_file(
                         os.path.join(DATA_DIR, os.path.basename(e["file"])))
-                    it = Item("image", pixbuf=pb, pinned=bool(e.get("pinned")))
+                    it = Item("image", pixbuf=pb, pinned=bool(e.get("pinned")),
+                              when=e.get("time"))
                 self.items.append(it)
             except (KeyError, TypeError, GLib.Error):
                 continue
 
 
+# ------------------------------------------------- emoji, kaomoji, symbols
+
+# GTK ships the emoji list it uses for its own emoji chooser:
+# (codepoints, name, keywords, group). Group 2 is skin-tone components.
+EMOJI_GROUPS = [
+    (0, "\U0001F600", "Smileys & emotion"),
+    (1, "\U0001F44B", "People"),
+    (3, "\U0001F43B", "Animals & nature"),
+    (4, "\U0001F354", "Food & drink"),
+    (5, "\U0001F697", "Travel & places"),
+    (6, "\u26BD", "Activities"),
+    (7, "\U0001F4A1", "Objects"),
+    (8, "\u2764\uFE0F", "Symbols"),
+    (9, "\U0001F3C1", "Flags"),
+]
+
+
+def load_emoji():
+    """Returns {group: [(text, name, keywords)]}."""
+    groups = {}
+    try:
+        data = Gio.resources_lookup_data("/org/gtk/libgtk/emoji/en.data", 0)
+        entries = GLib.Variant.new_from_bytes(
+            GLib.VariantType("a(ausasu)"), data, True).unpack()
+    except (GLib.Error, TypeError, ValueError):
+        entries = []
+    for codepoints, name, keywords, group in entries:
+        if group == 2:
+            continue
+        text = "".join(chr(c) for c in codepoints if c)   # 0 = skin tone slot
+        if len(text) == 1 and ord(text) < 0x1F000:
+            text += "️"    # older symbols like ❤ default to text style without it
+        groups.setdefault(group, []).append((text, name, " ".join(keywords)))
+    if not groups:   # very old GTK: fall back to the Emoticons block
+        import unicodedata
+        groups[0] = [(chr(c), unicodedata.name(chr(c), "").lower(), "")
+                     for c in range(0x1F600, 0x1F650)]
+    return groups
+
+
+KAOMOJI = [
+    ("\U0001F642", "Classic", [
+        ":-)", ":-(", ";-)", ":-D", ":-P", ":-O", ":-|", ":-/", "<3", "</3",
+        "^_^", "^_~", "-_-", "o_O", "T_T", ">_<", "=_=", "x_x", "*_*", "@_@",
+    ]),
+    ("\U0001F604", "Happy", [
+        "(\u25d5\u203f\u25d5)", "(\uff3e\u25bd\uff3e)", "(*^\u203f^*)", "(\u2267\u25bd\u2266)",
+        "\\(^o^)/", "(\uff61\u2665\u203f\u2665\uff61)", "(\uff89\u25d5\u30ee\u25d5)\uff89*:\uff65\uff9f\u2727",
+        "\u30fd(\u30fb\u2200\u30fb)\uff89", "(\u2727\u03c9\u2727)", "(\u2312\u203f\u2312)",
+        "( \u02d8\u25bd\u02d8)\u3063\u2668", "\u0669(\u25d5\u203f\u25d5)\u06f6",
+    ]),
+    ("\U0001F44B", "Greeting", [
+        "(\u30ce\uff9f\u25bd\uff9f)\u30ce", "(*\u30fb\u03c9\u30fb)\uff89", "( \uff9f\u25bd\uff9f)/",
+        "(^_^)/", "\u30fe(\uff3e\u2207\uff3e)", "(\uffe3\u25bd\uffe3)\u30ce", "(\u2022\u25e1\u2022)/",
+        "\u30fe(\u30fb\u03c9\u30fb*)\uff89",
+    ]),
+    ("\U0001F917", "Love & hugs", [
+        "(\u3065\uffe3 \u00b3\uffe3)\u3065", "(\u3063\u02d8\u03c9\u02d8\u03c2 )", "(\u2665\u03c9\u2665*)",
+        "(\u00b4\u2200\uff40)\u2661", "(*\u02d8\ufe36\u02d8*).\uff61.:*\u2661", "\u2661(\u02c3\u0348 \u0336\u03c9 \u0336\u02c2\u0348)\u2661",
+        "(\u3063\u00b4\u25bd\uff40)\u3063", "\u2282(\u30fb\u25bd\u30fb\u2282)",
+    ]),
+    ("\U0001F622", "Sad", [
+        "(\u2565\ufe4f\u2565)", "(\u0ca5\ufe4f\u0ca5)", "(\u2565_\u2565)", "(\u3064\ufe4f\u2282)",
+        "(\u00b4\uff1b\u03c9\uff1b`)", "(\u2299\ufe4f\u2299)", "(\u30ce_<\u3002)", "( \u00b4\u2022\ufe35\u2022` )",
+    ]),
+    ("\U0001F620", "Angry", [
+        "(\u256c\u0ca0\u76ca\u0ca0)", "(\u0ca0_\u0ca0)", "(\u30ce\u0ca0\u76ca\u0ca0)\u30ce", "\u0669(\u256c\u0298\u76ca\u0298\u256c)\u06f6",
+        "(\uff03\uffe3\u0414\uffe3)", "(\u0482`\u0437\u00b4)", "(\u00ac_\u00ac)", "(\uffe3\u0438\uffe3)",
+    ]),
+    ("\U0001F62E", "Surprised", [
+        "(\u2299_\u2299)", "(\u00b0\u30ed\u00b0)", "\u03a3(\u00b0\u25b3\u00b0|||)", "(\u30fb\u3002\u30fb;)",
+        "(\uff9f\u0434\uff9f;)", "w(\u00b0\uff4f\u00b0)w", "(\u2299\u03c9\u2299)", "\u2299\ufe4f\u2299",
+    ]),
+    ("\U0001F937", "Classics & actions", [
+        "\u00af\\_(\u30c4)_/\u00af", "(\u256f\u00b0\u25a1\u00b0)\u256f\ufe35 \u253b\u2501\u253b",
+        "\u252c\u2500\u252c\u30ce( \u00ba _ \u00ba\u30ce)", "( \u0361\u00b0 \u035c\u0296 \u0361\u00b0)",
+        "(\u2310\u25a0_\u25a0)", "(\u2022_\u2022) ( \u2022_\u2022)>\u2310\u25a0-\u25a0 (\u2310\u25a0_\u25a0)",
+        "\u0ca0_\u0ca0", "(\u0e07'\u0300-'\u0301)\u0e07", "\u10da(\u0ca0\u76ca\u0ca0\u10da)",
+        "(\u3065\uff61\u25d5\u203f\u203f\u25d5\uff61)\u3065", "\u0295\u2022\u1d25\u2022\u0294", "(=^\uff65\u03c9\uff65^=)",
+    ]),
+]
+
+SYMBOL_GROUPS = [
+    ("\u203c", "Punctuation",
+     [(0x00A1, 0x00BF), (0x2010, 0x2027), (0x2030, 0x205E)]),
+    ("$", "Currency", [(0x0024, 0x0024), (0x00A2, 0x00A5), (0x20A0, 0x20C0)]),
+    ("\u00c7", "Latin", [(0x00C0, 0x00FF), (0x0100, 0x017F)]),
+    ("\u03a9", "Greek", [(0x0391, 0x03A9), (0x03B1, 0x03C9)]),
+    ("\u2211", "Math",
+     [(0x00B1, 0x00B1), (0x00D7, 0x00D7), (0x00F7, 0x00F7), (0x2070, 0x209C),
+      (0x2150, 0x215E), (0x2200, 0x22FF)]),
+    ("\u2192", "Arrows", [(0x2190, 0x21FF)]),
+    ("\u25a0", "Shapes", [(0x25A0, 0x25FF)]),
+]
+
+
+def load_symbols():
+    import unicodedata
+    groups = []
+    for icon, title, ranges in SYMBOL_GROUPS:
+        items = []
+        for lo, hi in ranges:
+            for c in range(lo, hi + 1):
+                name = unicodedata.name(chr(c), "")
+                # skip invisible characters (soft hyphen, spaces, controls)
+                if name and unicodedata.category(chr(c)) not in ("Cf", "Cc", "Zs", "Zl", "Zp"):
+                    items.append((chr(c), name.lower(), ""))
+        groups.append((icon, title, items))
+    return groups
+
+
+WORD_SPLIT = re.compile(r"[\s:,_()\-]+")
+
+
+class GridPage(Gtk.Box):
+    """A tab with a grid of things to insert and a category bar, like the
+    emoji, kaomoji and symbols tabs of the Windows 11 panel."""
+
+    MAX_RESULTS = 240
+
+    def __init__(self, panel, kind, categories, per_line):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.panel = panel
+        self.kind = kind
+        self.categories = categories      # [(icon, title, items_fn)]
+        self.current = 0
+        self.get_style_context().add_class("winv-grid-" + kind)
+
+        self.title = Gtk.Label(xalign=0)
+        self.title.get_style_context().add_class("winv-section")
+        self.pack_start(self.title, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.scroll = scroll
+        self.flow = Gtk.FlowBox()
+        self.flow.set_homogeneous(True)
+        self.flow.set_valign(Gtk.Align.START)
+        self.flow.set_min_children_per_line(per_line)
+        self.flow.set_max_children_per_line(per_line)
+        self.flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.flow.set_activate_on_single_click(True)
+        self.flow.connect("child-activated",
+                          lambda _f, child: panel.app.insert_text(child.text, kind))
+        scroll.add(self.flow)
+        self.pack_start(scroll, True, True, 0)
+
+        self.empty = Gtk.Label(label="No results")
+        self.empty.get_style_context().add_class("winv-empty")
+        self.empty.set_no_show_all(True)
+        self.pack_start(self.empty, True, True, 0)
+
+        bar = Gtk.Box(spacing=2)
+        bar.get_style_context().add_class("winv-catbar")
+        bar.set_halign(Gtk.Align.CENTER)
+        self.cat_buttons = []
+        for i, (icon, title, _fn) in enumerate(categories):
+            btn = Gtk.Button(label=icon)
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_can_focus(False)
+            btn.set_tooltip_text(title)
+            btn.connect("clicked", lambda _b, i=i: self.show_category(i))
+            bar.pack_start(btn, False, False, 0)
+            self.cat_buttons.append(btn)
+        self.pack_end(bar, False, False, 0)
+
+    def _fill(self, items):
+        for child in self.flow.get_children():
+            self.flow.remove(child)
+        for text, name, _kw in items:
+            label = Gtk.Label(label=text)
+            label.set_ellipsize(Pango.EllipsizeMode.END)
+            label.set_max_width_chars(14)    # keeps long kaomoji from widening the grid
+            child = Gtk.FlowBoxChild()
+            child.text = text
+            child.add(label)
+            if name:
+                child.set_tooltip_text(name)
+            self.flow.add(child)
+        self.flow.show_all()
+        self.empty.set_visible(not items)
+        self.scroll.set_visible(bool(items))
+        self.scroll.get_vadjustment().set_value(0)
+
+    def show_category(self, index):
+        items = self.categories[index][2]()
+        if not items and index == 0 and len(self.categories) > 1 \
+                and self.categories[0][1] == "Recently used":
+            index, items = 1, self.categories[1][2]()
+        self.current = index
+        for i, btn in enumerate(self.cat_buttons):
+            ctx = btn.get_style_context()
+            (ctx.add_class if i == index else ctx.remove_class)("active")
+        self.title.set_text(self.categories[index][1])
+        self._fill(items)
+
+    def search(self, query):
+        if not query:
+            self.show_category(self.current)
+            return
+        words = query.split()
+        seen, scored = set(), []
+        for _icon, title, fn in self.categories:
+            if title == "Recently used":
+                continue
+            for entry in fn():
+                text, name, kw = entry
+                if text in seen:
+                    continue
+                name = name.lower()
+                # every typed word must start a word of the name or keywords
+                # ("cat" finds "cat face", not "communication")
+                name_words = WORD_SPLIT.split(name)
+                all_words = name_words + WORD_SPLIT.split(kw.lower()) + [text]
+                if not all(any(t.startswith(w) for t in all_words) for w in words):
+                    continue
+                seen.add(text)
+                # best first: exact name, name starts with it, all words in
+                # the name, then keyword-only matches
+                if name == query:
+                    rank = 0
+                elif name.startswith(query):
+                    rank = 1
+                elif all(any(t.startswith(w) for t in name_words) for w in words):
+                    rank = 2
+                else:
+                    rank = 3
+                scored.append((rank, len(scored), entry))
+        scored.sort()
+        results = [entry for _r, _i, entry in scored[:self.MAX_RESULTS]]
+        for btn in self.cat_buttons:
+            btn.get_style_context().remove_class("active")
+        self.title.set_text("Search results")
+        self._fill(results)
+
+    def activate_first(self):
+        children = self.flow.get_children()
+        if children:
+            self.panel.app.insert_text(children[0].text, self.kind)
+
+
 # ------------------------------------------------------------------- panel
+
+TABS = [   # (id, label, tooltip)
+    ("emoji", "\U0001F60A", "Emoji"),
+    ("kaomoji", ";-)", "Kaomoji"),
+    ("symbols", "\u03a9", "Symbols"),
+    ("clipboard", "\U0001F4CB", "Clipboard history"),
+]
+
 
 class Panel(Gtk.Window):
     def __init__(self, app):
         super().__init__(type=Gtk.WindowType.TOPLEVEL, title="Clipboard")
         self.app = app
         self._shown_at = 0.0
+        self.query = ""
+        self.tab = "clipboard"
         self.set_decorated(False)
         self.set_resizable(False)
         self.set_skip_taskbar_hint(True)
@@ -334,28 +673,62 @@ class Panel(Gtk.Window):
         panel.get_style_context().add_class("winv-panel")
         self.add(panel)
 
+        # header: title + close
         header = Gtk.Box(spacing=8)
-        header.set_margin_top(12)
-        header.set_margin_bottom(8)
+        header.set_margin_top(10)
         header.set_margin_start(18)
-        header.set_margin_end(12)
-        title = Gtk.Label(label="Clipboard", xalign=0)
-        title.get_style_context().add_class("winv-title")
-        header.pack_start(title, True, True, 0)
-        header.pack_end(self._icon_button("window-close-symbolic", "✕", "Close",
+        header.set_margin_end(10)
+        self.title = Gtk.Label(label="Emoji and more", xalign=0)
+        self.title.get_style_context().add_class("winv-title")
+        header.pack_start(self.title, True, True, 0)
+        header.pack_end(self._icon_button("window-close-symbolic", "\u2715", "Close",
                                           lambda *_: self.hide()), False, False, 0)
         panel.pack_start(header, False, False, 0)
 
+        # tab bar
+        tabs = Gtk.Box(spacing=4)
+        tabs.get_style_context().add_class("winv-tabs")
+        tabs.set_margin_start(12)
+        tabs.set_margin_top(4)
+        self.tab_buttons = {}
+        for tab_id, label, tooltip in TABS:
+            btn = Gtk.Button(label=label)
+            btn.get_style_context().add_class("winv-tab")
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_can_focus(False)
+            btn.set_tooltip_text(tooltip)
+            btn.connect("clicked", lambda _b, t=tab_id: self.show_tab(t))
+            tabs.pack_start(btn, False, False, 0)
+            self.tab_buttons[tab_id] = btn
+        panel.pack_start(tabs, False, False, 0)
+
+        # search
+        self.search = Gtk.SearchEntry()
+        self.search.set_margin_start(14)
+        self.search.set_margin_end(14)
+        self.search.set_margin_top(8)
+        self.search.set_margin_bottom(4)
+        self.search.connect("search-changed", self._on_search)
+        self.search.connect("activate", self._on_search_activate)
+        panel.pack_start(self.search, False, False, 0)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        self.stack.set_size_request(PANEL_WIDTH, LIST_HEIGHT)
+        panel.pack_start(self.stack, True, True, 0)
+
+        # clipboard history
+        self.clip_title = Gtk.Label(label="Clipboard", xalign=0)
+        self.clip_title.get_style_context().add_class("winv-section")
+        self.clip_title.get_style_context().add_class("winv-clip-title")
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_size_request(PANEL_WIDTH, LIST_HEIGHT)
-        panel.pack_start(scroll, True, True, 0)
-
         self.listbox = Gtk.ListBox()
         self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.listbox.set_activate_on_single_click(True)
         self.listbox.get_style_context().add_class("winv-list")
         self.listbox.connect("row-activated", lambda _lb, row: self.app.paste_item(row.item))
+        self.listbox.set_filter_func(self._clip_filter)
         empty = Gtk.Label(
             label="Nothing here\n\nYou'll see your clipboard history here\n"
                   "once you've copied something.",
@@ -364,11 +737,104 @@ class Panel(Gtk.Window):
         empty.show()
         self.listbox.set_placeholder(empty)
         scroll.add(self.listbox)
-        panel.pack_end(Gtk.Box(height_request=8), False, False, 0)
+        clip_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        clip_head = Gtk.Box(spacing=6)
+        clip_head.pack_start(self.clip_title, False, False, 0)
+        self.clip_count = Gtk.Label()
+        self.clip_count.get_style_context().add_class("winv-count")
+        self.clip_count.set_valign(Gtk.Align.CENTER)
+        clip_head.pack_start(self.clip_count, False, False, 0)
+        clear_all = Gtk.Button(label="Clear all")
+        clear_all.get_style_context().add_class("winv-clear")
+        clear_all.set_relief(Gtk.ReliefStyle.NONE)
+        clear_all.set_can_focus(False)
+        clear_all.set_tooltip_text("Remove everything except pinned items")
+        clear_all.connect("clicked", lambda *_: self.app.clear_history())
+        clear_all.set_margin_end(14)
+        clip_head.pack_end(clear_all, False, False, 0)
+        clip_page.pack_start(clip_head, False, False, 0)
+        clip_page.pack_start(scroll, True, True, 0)
+        self.stack.add_named(clip_page, "clipboard")
+
+        # emoji / kaomoji / symbols
+        emoji = load_emoji()
+        self._emoji_names = {t: n for g in emoji.values() for t, n, _k in g}
+        recent = lambda kind, names: (lambda: [
+            (t, names.get(t, ""), "") for t in self.app.recent.get(kind, [])])
+        emoji_cats = [("\U0001F552", "Recently used", recent("emoji", self._emoji_names))]
+        emoji_cats += [(icon, title, (lambda g=g: emoji.get(g, [])))
+                       for g, icon, title in EMOJI_GROUPS if g in emoji]
+        kao_cats = [("\U0001F552", "Recently used", recent("kaomoji", {}))]
+        kao_cats += [(icon, title, (lambda items=items: [(k, title, "") for k in items]))
+                     for icon, title, items in KAOMOJI]
+        symbols = load_symbols()
+        sym_names = {t: n for _i, _t, items in symbols for t, n, _k in items}
+        sym_cats = [("\U0001F552", "Recently used", recent("symbols", sym_names))]
+        sym_cats += [(icon, title, (lambda items=items: items))
+                     for icon, title, items in symbols]
+        self.pages = {
+            "emoji": GridPage(self, "emoji", emoji_cats, 8),
+            "kaomoji": GridPage(self, "kaomoji", kao_cats, 3),
+            "symbols": GridPage(self, "symbols", sym_cats, 8),
+        }
+        for tab_id, page in self.pages.items():
+            self.stack.add_named(page, tab_id)
+
+        panel.pack_end(Gtk.Box(height_request=6), False, False, 0)
 
         self.connect("key-press-event", self._on_key)
         self.connect("focus-out-event", self._on_focus_out)
         self.connect("delete-event", lambda *_: self.hide() or True)
+
+    # -- tabs and search
+
+    def show_tab(self, tab):
+        self.tab = tab
+        for tab_id, btn in self.tab_buttons.items():
+            ctx = btn.get_style_context()
+            (ctx.add_class if tab_id == tab else ctx.remove_class)("active")
+        self.stack.set_visible_child_name(tab)
+        self.search.set_placeholder_text(
+            "Search clipboard" if tab == "clipboard" else "Search " + tab)
+        if self.search.get_text():
+            self.search.set_text("")      # triggers _on_search
+        else:
+            self._apply_query()
+        if tab == "clipboard":
+            row = self.listbox.get_selected_row()
+            if row is not None and self.get_visible():
+                row.grab_focus()
+        elif self.get_visible():
+            self.search.grab_focus_without_selecting()
+
+    def _on_search(self, entry):
+        self.query = entry.get_text().strip().lower()
+        self._apply_query()
+
+    def _apply_query(self):
+        if self.tab == "clipboard":
+            self.listbox.invalidate_filter()
+            self.clip_title.set_text("Search results" if self.query else "Clipboard")
+            for row in self.listbox.get_children():
+                if self._clip_filter(row):
+                    self.listbox.select_row(row)
+                    break
+        else:
+            self.pages[self.tab].search(self.query)
+
+    def _clip_filter(self, row):
+        if not self.query:
+            return True
+        item = row.item
+        return item.kind == "text" and self.query in item.text.lower()
+
+    def _on_search_activate(self, _entry):
+        if self.tab == "clipboard":
+            row = self.listbox.get_selected_row()
+            if row is not None and self._clip_filter(row):
+                self.app.paste_item(row.item)
+        else:
+            self.pages[self.tab].activate_first()
 
     # -- rows
 
@@ -407,14 +873,22 @@ class Panel(Gtk.Window):
                     GdkPixbuf.InterpType.BILINEAR)
             body = Gtk.Image.new_from_pixbuf(item.thumb)
             body.set_halign(Gtk.Align.START)
-        box.pack_start(body, True, True, 0)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        content.pack_start(body, True, True, 0)
+        meta = time_ago(item.time)
+        if item.kind == "image":
+            meta += "  ·  %d × %d" % (item.pixbuf.get_width(), item.pixbuf.get_height())
+        meta_label = Gtk.Label(label=meta, xalign=0)
+        meta_label.get_style_context().add_class("winv-meta")
+        content.pack_end(meta_label, False, False, 0)
+        box.pack_start(content, True, True, 0)
 
         # Like Windows 11: "..." top right (expands to Delete / Clear all),
         # pin bottom right.
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         actions = Gtk.Box(spacing=2)
         actions.set_halign(Gtk.Align.END)
-        actions.pack_start(self._icon_button("user-trash-symbolic", "✕", "Delete",
+        actions.pack_start(self._icon_button("user-trash-symbolic", "\u2715", "Delete",
                                              lambda *_: self.app.delete_item(item)),
                            False, False, 0)
         clear = Gtk.Button(label="Clear all")
@@ -431,12 +905,12 @@ class Panel(Gtk.Window):
         def expand(btn):
             btn.hide()
             actions.show()
-        more = self._icon_button("view-more-horizontal-symbolic", "⋯", "See more", expand)
+        more = self._icon_button("view-more-horizontal-symbolic", "\u22ef", "See more", expand)
         more.set_halign(Gtk.Align.END)
         side.pack_start(more, False, False, 0)
         side.pack_start(actions, False, False, 0)
 
-        pin = self._icon_button("view-pin-symbolic", "★",
+        pin = self._icon_button("view-pin-symbolic", "\u2605",
                                 "Unpin" if item.pinned else "Pin",
                                 lambda *_: self.app.toggle_pin(item))
         pin.set_halign(Gtk.Align.END)
@@ -448,18 +922,20 @@ class Panel(Gtk.Window):
         row.add(box)
         return row
 
-
     def refresh(self, select=0):
         for child in self.listbox.get_children():
             self.listbox.remove(child)
         for item in self.app.history.items:
             self.listbox.add(self._make_row(item))
+        count = len(self.app.history.items)
+        self.clip_count.set_text(str(count))
+        self.clip_count.set_visible(count > 0)
         self.listbox.show_all()
         rows = self.listbox.get_children()
         if rows:
             row = rows[max(0, min(select, len(rows) - 1))]
             self.listbox.select_row(row)
-            if self.get_visible():
+            if self.get_visible() and self.tab == "clipboard" and not self.search.has_focus():
                 row.grab_focus()
 
     def selected_index(self):
@@ -494,9 +970,12 @@ class Panel(Gtk.Window):
             y = min(max(py + 12, area.y), area.y + area.height - h)
         self.move(x, y)
 
-    def popup(self):
+    def popup(self, tab="clipboard"):
+        for page in self.pages.values():
+            page.current = 0     # open on "Recently used", like Windows
         self.refresh()
         self.show_all()
+        self.show_tab(tab)
         self._place()
         stamp = Gdk.CURRENT_TIME
         try:
@@ -511,19 +990,32 @@ class Panel(Gtk.Window):
         self.present_with_time(stamp)
         self._place()
         self.listbox.get_adjustment().set_value(0)
-        row = self.listbox.get_selected_row()
-        if row is not None:
-            row.grab_focus()
+        self.show_tab(tab)
 
     def _on_key(self, _w, event):
         if event.keyval == Gdk.KEY_Escape:
-            self.hide()
+            if self.search.get_text():
+                self.search.set_text("")
+            else:
+                self.hide()
             return True
-        if event.keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete):
+        if self.search.has_focus():
+            if event.keyval == Gdk.KEY_Down and self.tab == "clipboard":
+                row = self.listbox.get_selected_row()
+                if row is not None:
+                    row.grab_focus()
+                    return True
+            return False
+        if event.keyval in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete) and self.tab == "clipboard":
             row = self.listbox.get_selected_row()
             if row is not None:
                 self.app.delete_item(row.item)
             return True
+        # Typing anywhere goes to the search box, as in Windows.
+        mods = event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK)
+        if not mods and Gdk.keyval_to_unicode(event.keyval) > 32:
+            self.search.grab_focus_without_selecting()
+            return self.search.handle_event(event)
         return False
 
     def _on_focus_out(self, *_):
@@ -548,11 +1040,21 @@ class App(Gtk.Application):
         self._ignore_until = 0.0
         self._xdisplay = None
         self._last_release = -1
+        self._hotkeys = {}
+        self.recent = {}
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
         self.cfg = load_config()
         self.history = History(self.cfg)
+        try:
+            with open(RECENT_FILE) as f:
+                recent = json.load(f)
+            if isinstance(recent, dict):
+                self.recent = {k: [s for s in v if isinstance(s, str)][:MAX_RECENT]
+                               for k, v in recent.items() if isinstance(v, list)}
+        except (OSError, ValueError):
+            pass
 
         provider = Gtk.CssProvider()
         palette = PALETTES["dark" if prefers_dark(self.cfg) else "light"]
@@ -574,6 +1076,8 @@ class App(Gtk.Application):
         for arg in command_line.get_arguments()[1:]:
             if arg == "--toggle":
                 self.toggle()
+            elif arg == "--emoji":
+                self.toggle("emoji")
             elif arg == "--show":
                 self.show_panel()
             elif arg == "--hide":
@@ -632,13 +1136,15 @@ class App(Gtk.Application):
 
     # -- actions
 
-    def toggle(self):
-        if self.panel.get_visible():
+    def toggle(self, tab="clipboard"):
+        if not self.panel.get_visible():
+            self.show_panel(tab)
+        elif self.panel.tab == tab:
             self.panel.hide()
         else:
-            self.show_panel()
+            self.panel.show_tab(tab)
 
-    def show_panel(self):
+    def show_panel(self, tab="clipboard"):
         if self.panel.get_visible():
             return
         self.prev_window = None
@@ -646,7 +1152,31 @@ class App(Gtk.Application):
             ok, out = run(["xdotool", "getactivewindow"], timeout=1)
             if ok and out.strip().isdigit():
                 self.prev_window = out.strip()
-        self.panel.popup()
+        self.panel.popup(tab)
+
+    def insert_text(self, text, kind):
+        """Type an emoji / kaomoji / symbol into the previous window. Like
+        Windows, it is not added to the clipboard history, and the clipboard
+        gets its previous content back afterwards."""
+        recent = [t for t in self.recent.get(kind, []) if t != text]
+        self.recent[kind] = [text] + recent[:MAX_RECENT - 1]
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(RECENT_FILE, "w") as f:
+                json.dump(self.recent, f)
+        except OSError as e:
+            log("could not save recently used items: %s" % e)
+        self._ignore_until = time.monotonic() + 0.5
+        self.clipboard.set_text(text, -1)
+        self.panel.hide()
+        if self.cfg.get("auto_paste", True):
+            GLib.timeout_add(150, self._send_paste)
+            GLib.timeout_add(1200, self._restore_clipboard)
+
+    def _restore_clipboard(self):
+        if self.history.items:
+            self._set_clipboard(self.history.items[0])
+        return False
 
     def paste_item(self, item):
         self.history.add(item)                 # moves it to the top
@@ -722,15 +1252,22 @@ class App(Gtk.Application):
             from Xlib import X, XK, display, error
             d = display.Display()
             root = d.screen().root
-            keycode = d.keysym_to_keycode(XK.XK_v)
-            refused = error.CatchError(error.BadAccess)
-            for lock in (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask):
-                root.grab_key(keycode, X.Mod4Mask | lock, True,
-                              X.GrabModeAsync, X.GrabModeAsync, onerror=refused)
-            d.sync()
-            if refused.get_error():
-                log("Super+V is already taken by the desktop; "
-                    "bind `winv --toggle` to a shortcut there if it does not open the panel")
+            keys = ((XK.XK_v, X.Mod4Mask, "clipboard", "Super+V", "--toggle"),
+                    (XK.XK_period, X.Mod4Mask, "emoji", "Super+.", "--emoji"),
+                    (XK.XK_v, X.ControlMask | X.Mod1Mask, "clipboard", "Ctrl+Alt+V", "--toggle"))
+            for keysym, mods, tab, name, cmd in keys:
+                keycode = d.keysym_to_keycode(keysym)
+                refused = error.CatchError(error.BadAccess)
+                for lock in (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask):
+                    root.grab_key(keycode, mods | lock, True,
+                                  X.GrabModeAsync, X.GrabModeAsync, onerror=refused)
+                d.sync()
+                if refused.get_error():
+                    log("%s is already taken by the desktop; bind `winv %s` to a "
+                        "shortcut there if it does not open the panel" % (name, cmd))
+                else:
+                    self._hotkeys[(keycode, mods)] = tab
+            if not self._hotkeys:
                 d.close()
                 return
             self._xdisplay = d
@@ -749,7 +1286,10 @@ class App(Gtk.Application):
             elif ev.type == X.KeyPress:
                 if ev.time == self._last_release:   # keyboard auto-repeat
                     continue
-                self.toggle()
+                mods = ev.state & (X.Mod4Mask | X.ControlMask | X.Mod1Mask)
+                tab = self._hotkeys.get((ev.detail, mods))
+                if tab is not None:
+                    self.toggle(tab)
         return True
 
 
@@ -766,31 +1306,43 @@ def _schema(schema_id):
     return source.lookup(schema_id, True) if source is not None else None
 
 
-def _toggle_command():
+GNOME_BINDINGS = [   # (dconf path, name, winv option, key)
+    (GNOME_KB_PATH, "Clipboard History", "--toggle", "<Super>v"),
+    (GNOME_KB_PATH.rstrip("/") + "-emoji/", "Emoji Picker", "--emoji", "<Super>period"),
+    (GNOME_KB_PATH.rstrip("/") + "-alt/", "Clipboard History (alternative)",
+     "--toggle", "<Primary><Alt>v"),
+]
+
+
+def _winv_command(option):
     path = os.path.realpath(sys.argv[0])
     if not (os.path.isfile(path) and os.access(path, os.X_OK)):
         path = shutil.which("winv") or "winv"
-    return path + " --toggle"
+    return "%s %s" % (path, option)
 
 
 def setup_hotkey(quiet=False):
-    """Bind Super+V to `winv --toggle` in GNOME-style desktops (GNOME, Ubuntu,
-    Budgie, Pop). GNOME uses Super+V for the notification list by default;
-    that binding is reduced to its other default, Super+M."""
+    """Bind Super+V (clipboard) and Super+. (emoji) in GNOME-style desktops
+    (GNOME, Ubuntu, Budgie, Pop). GNOME uses Super+V for the notification
+    list by default; that binding is reduced to its other default, Super+M."""
     if _schema(GNOME_MK) is None or _schema(GNOME_KB) is None:
         if not quiet:
             print("No GNOME keybinding settings found.\n"
-                  "On X11 desktops winv grabs Super+V by itself. Otherwise add a custom\n"
-                  "shortcut in your desktop settings that runs:  " + _toggle_command())
+                  "On X11 desktops winv grabs Super+V and Super+. by itself. Otherwise add\n"
+                  "custom shortcuts in your desktop settings that run:\n"
+                  "  Super+V:  %s\n  Super+.:  %s"
+                  % (_winv_command("--toggle"), _winv_command("--emoji")))
         return False
     media = Gio.Settings.new(GNOME_MK)
     paths = list(media.get_strv("custom-keybindings"))
-    if GNOME_KB_PATH not in paths:
-        media.set_strv("custom-keybindings", paths + [GNOME_KB_PATH])
-    kb = Gio.Settings.new_with_path(GNOME_KB, GNOME_KB_PATH)
-    kb.set_string("name", "Clipboard History")
-    kb.set_string("command", _toggle_command())
-    kb.set_string("binding", "<Super>v")
+    for path, name, option, key in GNOME_BINDINGS:
+        if path not in paths:
+            paths.append(path)
+        kb = Gio.Settings.new_with_path(GNOME_KB, path)
+        kb.set_string("name", name)
+        kb.set_string("command", _winv_command(option))
+        kb.set_string("binding", key)
+    media.set_strv("custom-keybindings", paths)
     shell = _schema(GNOME_SHELL_KB)
     if shell is not None and shell.has_key("toggle-message-tray"):
         s = Gio.Settings.new(GNOME_SHELL_KB)
@@ -800,7 +1352,7 @@ def setup_hotkey(quiet=False):
             s.set_strv("toggle-message-tray", kept)
     Gio.Settings.sync()
     if not quiet:
-        print("Super+V now opens the clipboard history.")
+        print("Super+V (or Ctrl+Alt+V) now opens the clipboard history and Super+. the emoji picker.")
     return True
 
 
@@ -809,13 +1361,13 @@ def remove_hotkey():
         print("No GNOME keybinding settings found; nothing to remove.")
         return
     media = Gio.Settings.new(GNOME_MK)
-    paths = list(media.get_strv("custom-keybindings"))
-    if GNOME_KB_PATH in paths:
-        paths.remove(GNOME_KB_PATH)
-        media.set_strv("custom-keybindings", paths)
-    kb = Gio.Settings.new_with_path(GNOME_KB, GNOME_KB_PATH)
-    for key in ("name", "command", "binding"):
-        kb.reset(key)
+    ours = [b[0] for b in GNOME_BINDINGS]
+    media.set_strv("custom-keybindings",
+                   [p for p in media.get_strv("custom-keybindings") if p not in ours])
+    for path in ours:
+        kb = Gio.Settings.new_with_path(GNOME_KB, path)
+        for key in ("name", "command", "binding"):
+            kb.reset(key)
     shell = _schema(GNOME_SHELL_KB)
     if shell is not None and shell.has_key("toggle-message-tray"):
         Gio.Settings.new(GNOME_SHELL_KB).reset("toggle-message-tray")
@@ -824,7 +1376,7 @@ def remove_hotkey():
         os.unlink(HOTKEY_MARKER)
     except OSError:
         pass
-    print("Super+V shortcut removed.")
+    print("Super+V, Ctrl+Alt+V and Super+. shortcuts removed.")
 
 
 def _service_running(bus):
@@ -856,7 +1408,7 @@ def ensure_service():
 
 def main():
     args = sys.argv[1:]
-    if "--toggle" in args or "--show" in args:
+    if "--toggle" in args or "--show" in args or "--emoji" in args:
         ensure_service()
     elif any(a in args for a in ("--hide", "--clear", "--quit")):
         try:   # nothing to hide, clear or stop when the service isn't running

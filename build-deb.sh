@@ -20,12 +20,14 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.6), python3-gi, gir1.2-gtk-3.0, python3-xlib, xdotool, x11-utils
-Suggests: ydotool, wtype
+Recommends: fonts-noto-color-emoji
+Suggests: ydotool, wtype, fonts-noto-cjk
 Maintainer: winv <winv@localhost>
 Description: Windows-style (Win+V) clipboard history
  Keeps the last 25 copied texts and images and shows them in a panel
  opened with Super+V. Entries can be pinned, deleted or cleared, and the
  selected entry is pasted straight into the window you were working in.
+ Includes a searchable emoji, kaomoji and symbol picker (Super+.).
 EOF
 printf '/etc/xdg/autostart/winv.desktop\n' > "$PKG/DEBIAN/conffiles"
 
