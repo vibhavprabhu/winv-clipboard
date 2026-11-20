@@ -9,7 +9,7 @@
 import os
 import sys
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_ID = "io.github.winv.ClipboardHistory"
 
 USAGE = """winv %s - Win+V style clipboard history
@@ -77,6 +77,7 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 HOTKEY_MARKER = os.path.join(CONFIG_DIR, "hotkeys-configured-v2")   # v2 adds Super+.
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 RECENT_FILE = os.path.join(CONFIG_DIR, "recent.json")   # recently used emoji etc.
+POSITION_FILE = os.path.join(CONFIG_DIR, "position.json")   # where the panel was dragged
 MAX_RECENT = 32
 
 # Terminals paste with Ctrl+Shift+V instead of Ctrl+V.
@@ -89,10 +90,10 @@ TERMINALS = {
     "roxterm", "cool-retro-term", "blackbox", "x-terminal-emulator",
 }
 
-# Windows 11 colours: (panel, card, card hover, text, dim text, border, focus ring, accent)
+# (panel, card, card hover, text, dim text, border, focus ring, accent)
 PALETTES = {
-    "dark": ("#2c2c2c", "#383838", "#404040", "#ffffff", "#c5c5c5", "#4a4a4a", "#ffffff", "#60cdff"),
-    "light": ("#f3f3f3", "#fbfbfb", "#f6f6f6", "#1a1a1a", "#5f5f5f", "#d6d6d6", "#1a1a1a", "#005fb8"),
+    "dark": ("#1f2130", "#2a2c3d", "#33364a", "#f3f3f7", "#a3a6b9", "#3a3d52", "#8ab4ff", "#8ab4ff"),
+    "light": ("#f3f4f9", "#ffffff", "#eef0f7", "#1b1c22", "#5d6070", "#dcdfe9", "#2f6fe0", "#2f6fe0"),
 }
 
 CSS = """
@@ -112,11 +113,21 @@ window.winv.rounded { background-color: transparent; }
     border: 1px solid @wv_border;
     color: @wv_fg;
 }
-window.winv.rounded .winv-panel { border-radius: 9px; }
+window.winv.rounded .winv-panel {
+    border-radius: 14px;
+    background-color: alpha(@wv_bg, 0.97);
+}
 .winv scrolledwindow, .winv viewport, .winv list { background-color: transparent; }
 .winv label { color: @wv_fg; }
-.winv-title { font-size: 1.15em; }
 .winv label.winv-empty { color: @wv_dim; }
+
+/* grab handle at the top: drag it (or the empty header) to move the panel */
+.winv-handle {
+    min-width: 36px;
+    min-height: 4px;
+    border-radius: 2px;
+    background-color: alpha(@wv_fg, 0.28);
+}
 
 .winv button {
     background-image: none;
@@ -135,44 +146,64 @@ window.winv.rounded .winv-panel { border-radius: 9px; }
 .winv button:active { background-color: alpha(@wv_fg, 0.06); }
 
 .winv-row {
-    margin: 4px 14px;
-    padding: 8px 6px 6px 12px;
-    min-height: 68px;
-    border-radius: 6px;
-    border: 2px solid transparent;
+    margin: 4px 12px;
+    padding: 10px 6px 8px 10px;
+    min-height: 64px;
+    border-radius: 10px;
+    border: 1px solid alpha(@wv_fg, 0.06);
     background-color: @wv_card;
     color: @wv_fg;
 }
 .winv-row:hover { background-color: @wv_card_hover; }
-.winv-row:selected { background-color: @wv_card; border-color: @wv_ring; color: @wv_fg; }
-.winv-row label { font-size: 1.05em; }
+.winv-row, .winv flowboxchild { outline-color: transparent; }   /* the border shows focus */
+.winv-row:selected {
+    background-color: alpha(@wv_accent, 0.10);
+    border-color: alpha(@wv_ring, 0.75);
+    color: @wv_fg;
+}
+.winv-row label { font-size: 1.02em; }
+/* "T" / picture badge on the left of each clipboard card */
+.winv label.winv-kind, .winv image.winv-kind {
+    min-width: 28px;
+    min-height: 28px;
+    border-radius: 7px;
+    background-color: alpha(@wv_fg, 0.08);
+    color: @wv_dim;
+    font-family: serif;
+    font-weight: bold;
+}
 .winv-row button.pin { opacity: 0.5; }
 .winv-row button.pin:hover { opacity: 1; }
 .winv-row button.pin.pinned, .winv-row button.pin.pinned label { opacity: 1; color: @wv_accent; }
 
 .winv-row button.text { padding: 3px 8px; }
 
-/* tabs: emoji, kaomoji, symbols, clipboard */
+/* tabs: clipboard, emoji, kaomoji, symbols, as rounded tiles */
 .winv button.winv-tab {
-    font-size: 1.15em;
-    min-width: 40px;
+    font-size: 1.05em;
+    min-width: 36px;
     min-height: 32px;
-    padding: 2px 8px 4px 8px;
-    border-radius: 4px;
+    padding: 2px 6px;
+    border-radius: 8px;
+    color: @wv_dim;
 }
-.winv button.winv-tab.active { box-shadow: inset 0 -3px @wv_accent; }
+.winv button.winv-tab label, .winv button.winv-tab image { color: @wv_dim; }
+.winv button.winv-tab.active {
+    background-color: alpha(@wv_fg, 0.12);
+    box-shadow: inset 0 0 0 1px alpha(@wv_fg, 0.08);
+}
+.winv button.winv-tab.active label, .winv button.winv-tab.active image { color: @wv_fg; }
 
 .winv entry {
     background-image: none;
-    background-color: @wv_card;
+    background-color: alpha(@wv_fg, 0.06);
     color: @wv_fg;
-    border: 1px solid @wv_border;
-    border-bottom: 2px solid alpha(@wv_fg, 0.35);
-    border-radius: 5px;
+    border: 1px solid alpha(@wv_fg, 0.10);
+    border-radius: 9px;
     box-shadow: none;
-    min-height: 32px;
+    min-height: 34px;
 }
-.winv entry:focus { border-bottom-color: @wv_accent; }
+.winv entry:focus { border-color: alpha(@wv_accent, 0.8); }
 .winv entry image { color: @wv_dim; }
 
 .winv label.winv-section {
@@ -184,28 +215,35 @@ window.winv.rounded .winv-panel { border-radius: 9px; }
 .winv flowboxchild {
     padding: 0;
     margin: 1px;
-    border-radius: 5px;
+    border-radius: 8px;
     border: 2px solid transparent;
 }
 .winv flowboxchild:hover { background-color: alpha(@wv_fg, 0.09); }
 .winv flowboxchild:focus { border-color: @wv_ring; }
-.winv-grid-emoji flowboxchild label { font-size: 1.6em; padding: 2px 0; }
+.winv-grid-emoji flowboxchild label { font-size: 1.65em; padding: 3px 0; }
 .winv-grid-symbols flowboxchild label { font-size: 1.25em; padding: 4px 0; }
 .winv-grid-kaomoji flowboxchild {
     background-color: @wv_card;
+    border: 1px solid alpha(@wv_fg, 0.06);
     margin: 3px;
     min-height: 40px;
 }
 .winv-grid-kaomoji flowboxchild:hover { background-color: @wv_card_hover; }
 .winv-grid-kaomoji flowboxchild label { padding: 8px 4px; }
 
-.winv-catbar {
-    border-top: 1px solid @wv_border;
-    padding-top: 4px;
-    margin: 4px 10px 0 10px;
+/* category chips under the search box */
+.winv-chips { margin: 6px 10px 0 10px; }
+.winv-chips button.chip {
+    border-radius: 14px;
+    padding: 2px 11px;
+    min-height: 24px;
+    background-color: alpha(@wv_fg, 0.07);
+    font-size: 0.92em;
 }
-.winv-catbar button { font-size: 1.05em; min-width: 30px; padding: 3px 4px; }
-.winv-catbar button.active { box-shadow: inset 0 -2px @wv_accent; }
+.winv-chips button.chip:hover { background-color: alpha(@wv_fg, 0.13); }
+.winv-chips button.chip.active { background-color: @wv_accent; }
+.winv-chips button.chip.active label { color: @wv_bg; font-weight: bold; }
+.winv-chips button.arrow { min-width: 20px; padding: 0 2px; color: @wv_dim; }
 
 .winv label.winv-section.winv-clip-title { margin-right: 2px; }
 .winv label.winv-count {
@@ -215,8 +253,8 @@ window.winv.rounded .winv-panel { border-radius: 9px; }
     font-size: 0.85em;
     margin-top: 4px;
 }
-.winv button.winv-clear { color: @wv_dim; padding: 2px 8px; margin-top: 4px; }
-.winv button.winv-clear:hover { color: @wv_fg; }
+.winv button.winv-clear { padding: 2px 8px; margin-top: 4px; }
+.winv button.winv-clear label { color: @wv_accent; }
 .winv label.winv-meta { color: @wv_dim; font-size: 0.85em; }
 """
 
@@ -237,6 +275,27 @@ def prefers_dark(cfg):
         scheme = Gio.Settings.new("org.gnome.desktop.interface").get_string("color-scheme")
         return scheme == "prefer-dark"
     return False
+
+
+def load_positions():
+    """{monitor key: [x, y] relative to that monitor's work area}"""
+    try:
+        with open(POSITION_FILE) as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items()
+                if isinstance(v, list) and len(v) == 2
+                and all(isinstance(n, int) for n in v)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def save_positions(positions):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(POSITION_FILE, "w") as f:
+            json.dump(positions, f)
+    except OSError as e:
+        log("could not save the panel position: %s" % e)
 
 
 def time_ago(t):
@@ -409,6 +468,17 @@ EMOJI_GROUPS = [
     (9, "\U0001F3C1", "Flags"),
 ]
 
+# shorter names for the category chips (the full name stays as the heading)
+CHIP_NAMES = {
+    "Recently used": "Recent",
+    "Smileys & emotion": "Smileys",
+    "Animals & nature": "Animals",
+    "Food & drink": "Food",
+    "Travel & places": "Travel",
+    "Love & hugs": "Love",
+    "Classics & actions": "Actions",
+}
+
 
 def load_emoji():
     """Returns {group: [(text, name, keywords)]}."""
@@ -521,6 +591,37 @@ class GridPage(Gtk.Box):
         self.current = 0
         self.get_style_context().add_class("winv-grid-" + kind)
 
+        # category chips: ‹ [Recent] [Smileys] [People] … ›
+        chips = Gtk.Box(spacing=2)
+        chips.get_style_context().add_class("winv-chips")
+        self.chip_scroll = Gtk.ScrolledWindow()
+        self.chip_scroll.set_policy(Gtk.PolicyType.EXTERNAL, Gtk.PolicyType.NEVER)
+        self.chip_scroll.connect("scroll-event", self._on_chip_wheel)
+        bar = Gtk.Box(spacing=6)
+        self.cat_buttons = []
+        for i, (icon, title, _fn) in enumerate(categories):
+            btn = Gtk.Button(label=CHIP_NAMES.get(title, title))
+            btn.get_style_context().add_class("chip")
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_can_focus(False)
+            btn.set_tooltip_text(title)
+            btn.connect("clicked", lambda _b, i=i: self.show_category(i))
+            bar.pack_start(btn, False, False, 0)
+            self.cat_buttons.append(btn)
+        self.chip_scroll.add(bar)
+        for step, glyph in ((-1, "‹"), (1, "›")):
+            arrow = Gtk.Button(label=glyph)
+            arrow.get_style_context().add_class("arrow")
+            arrow.set_relief(Gtk.ReliefStyle.NONE)
+            arrow.set_can_focus(False)
+            arrow.connect("clicked", lambda _b, s=step: self._scroll_chips(s * 160))
+            if step < 0:
+                chips.pack_start(arrow, False, False, 0)
+                chips.pack_start(self.chip_scroll, True, True, 0)
+            else:
+                chips.pack_start(arrow, False, False, 0)
+        self.pack_start(chips, False, False, 0)
+
         self.title = Gtk.Label(xalign=0)
         self.title.get_style_context().add_class("winv-section")
         self.pack_start(self.title, False, False, 0)
@@ -545,19 +646,25 @@ class GridPage(Gtk.Box):
         self.empty.set_no_show_all(True)
         self.pack_start(self.empty, True, True, 0)
 
-        bar = Gtk.Box(spacing=2)
-        bar.get_style_context().add_class("winv-catbar")
-        bar.set_halign(Gtk.Align.CENTER)
-        self.cat_buttons = []
-        for i, (icon, title, _fn) in enumerate(categories):
-            btn = Gtk.Button(label=icon)
-            btn.set_relief(Gtk.ReliefStyle.NONE)
-            btn.set_can_focus(False)
-            btn.set_tooltip_text(title)
-            btn.connect("clicked", lambda _b, i=i: self.show_category(i))
-            bar.pack_start(btn, False, False, 0)
-            self.cat_buttons.append(btn)
-        self.pack_end(bar, False, False, 0)
+    def _scroll_chips(self, delta):
+        adj = self.chip_scroll.get_hadjustment()
+        adj.set_value(min(max(adj.get_value() + delta, adj.get_lower()),
+                          adj.get_upper() - adj.get_page_size()))
+
+    def _on_chip_wheel(self, _w, event):
+        ok, dx, dy = event.get_scroll_deltas()
+        if ok:
+            self._scroll_chips((dx + dy) * 40)
+        elif event.direction in (Gdk.ScrollDirection.UP, Gdk.ScrollDirection.LEFT):
+            self._scroll_chips(-60)
+        elif event.direction in (Gdk.ScrollDirection.DOWN, Gdk.ScrollDirection.RIGHT):
+            self._scroll_chips(60)
+        return True
+
+    def _reveal_chip(self, btn):
+        alloc = btn.get_allocation()
+        if alloc.width > 1:
+            self.chip_scroll.get_hadjustment().clamp_page(alloc.x - 24, alloc.x + alloc.width + 24)
 
     def _fill(self, items):
         for child in self.flow.get_children():
@@ -586,6 +693,7 @@ class GridPage(Gtk.Box):
         for i, btn in enumerate(self.cat_buttons):
             ctx = btn.get_style_context()
             (ctx.add_class if i == index else ctx.remove_class)("active")
+        self._reveal_chip(self.cat_buttons[index])
         self.title.set_text(self.categories[index][1])
         self._fill(items)
 
@@ -636,12 +744,20 @@ class GridPage(Gtk.Box):
 
 # ------------------------------------------------------------------- panel
 
-TABS = [   # (id, label, tooltip)
-    ("emoji", "\U0001F60A", "Emoji"),
-    ("kaomoji", ";-)", "Kaomoji"),
-    ("symbols", "\u03a9", "Symbols"),
-    ("clipboard", "\U0001F4CB", "Clipboard history"),
+TABS = [   # (id, symbolic icon or None, text fallback, tooltip)
+    ("clipboard", "edit-paste-symbolic", "\U0001F4CB", "Clipboard history"),
+    ("emoji", "face-smile-symbolic", "\u263a", "Emoji"),
+    ("kaomoji", None, ";-)", "Kaomoji"),
+    ("symbols", None, "\u03a9", "Symbols"),
 ]
+
+
+def has_icon(name):
+    try:    # the icon may be missing, or the theme may lack an SVG loader
+        Gtk.IconTheme.get_default().load_icon(name, 16, 0)
+        return True
+    except GLib.Error:
+        return False
 
 
 class Panel(Gtk.Window):
@@ -649,6 +765,10 @@ class Panel(Gtk.Window):
         super().__init__(type=Gtk.WindowType.TOPLEVEL, title="Clipboard")
         self.app = app
         self._shown_at = 0.0
+        self._drag_started = 0.0
+        self._track_moves = False
+        self._save_pos_id = 0
+        self.positions = load_positions()
         self.query = ""
         self.tab = "clipboard"
         self.set_decorated(False)
@@ -673,26 +793,27 @@ class Panel(Gtk.Window):
         panel.get_style_context().add_class("winv-panel")
         self.add(panel)
 
-        # header: title + close
-        header = Gtk.Box(spacing=8)
-        header.set_margin_top(10)
-        header.set_margin_start(18)
-        header.set_margin_end(10)
-        self.title = Gtk.Label(label="Emoji and more", xalign=0)
-        self.title.get_style_context().add_class("winv-title")
-        header.pack_start(self.title, True, True, 0)
-        header.pack_end(self._icon_button("window-close-symbolic", "\u2715", "Close",
-                                          lambda *_: self.hide()), False, False, 0)
-        panel.pack_start(header, False, False, 0)
-
-        # tab bar
+        # header: grab handle, then tab tiles on the left and close on the
+        # right. Dragging anywhere on it that is not a button moves the panel.
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        handle = Gtk.Box()
+        handle.get_style_context().add_class("winv-handle")
+        handle.set_halign(Gtk.Align.CENTER)
+        handle.set_margin_top(7)
+        header.pack_start(handle, False, False, 0)
         tabs = Gtk.Box(spacing=4)
         tabs.get_style_context().add_class("winv-tabs")
         tabs.set_margin_start(12)
+        tabs.set_margin_end(10)
         tabs.set_margin_top(4)
+        tabs.set_margin_bottom(2)
         self.tab_buttons = {}
-        for tab_id, label, tooltip in TABS:
-            btn = Gtk.Button(label=label)
+        for tab_id, icon, fallback, tooltip in TABS:
+            if icon and has_icon(icon):
+                btn = Gtk.Button()
+                btn.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU))
+            else:
+                btn = Gtk.Button(label=fallback)
             btn.get_style_context().add_class("winv-tab")
             btn.set_relief(Gtk.ReliefStyle.NONE)
             btn.set_can_focus(False)
@@ -700,7 +821,13 @@ class Panel(Gtk.Window):
             btn.connect("clicked", lambda _b, t=tab_id: self.show_tab(t))
             tabs.pack_start(btn, False, False, 0)
             self.tab_buttons[tab_id] = btn
-        panel.pack_start(tabs, False, False, 0)
+        tabs.pack_end(self._icon_button("window-close-symbolic", "\u2715", "Close",
+                                        lambda *_: self.hide()), False, False, 0)
+        header.pack_start(tabs, False, False, 0)
+        drag_area = Gtk.EventBox()
+        drag_area.add(header)
+        drag_area.connect("button-press-event", self._on_drag_start)
+        panel.pack_start(drag_area, False, False, 0)
 
         # search
         self.search = Gtk.SearchEntry()
@@ -785,6 +912,9 @@ class Panel(Gtk.Window):
         self.connect("key-press-event", self._on_key)
         self.connect("focus-out-event", self._on_focus_out)
         self.connect("delete-event", lambda *_: self.hide() or True)
+        self.connect("configure-event", self._on_configure)
+        self.connect("map-event", self._on_map)
+        self.connect("hide", self._on_hide)
 
     # -- tabs and search
 
@@ -840,10 +970,9 @@ class Panel(Gtk.Window):
 
     def _icon_button(self, icon, fallback, tooltip, handler):
         btn = Gtk.Button()
-        try:    # the icon may be missing, or the theme may lack an SVG loader
-            Gtk.IconTheme.get_default().load_icon(icon, 16, 0)
+        if has_icon(icon):
             btn.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU))
-        except GLib.Error:
+        else:
             btn.set_label(fallback)
         btn.set_relief(Gtk.ReliefStyle.NONE)
         btn.set_can_focus(False)
@@ -873,6 +1002,16 @@ class Panel(Gtk.Window):
                     GdkPixbuf.InterpType.BILINEAR)
             body = Gtk.Image.new_from_pixbuf(item.thumb)
             body.set_halign(Gtk.Align.START)
+        if item.kind == "text":
+            kind = Gtk.Label(label="T")
+        elif has_icon("image-x-generic-symbolic"):
+            kind = Gtk.Image.new_from_icon_name("image-x-generic-symbolic", Gtk.IconSize.MENU)
+        else:
+            kind = Gtk.Label(label="▣")
+        kind.get_style_context().add_class("winv-kind")
+        kind.set_valign(Gtk.Align.START)
+        kind.set_margin_end(4)
+        box.pack_start(kind, False, False, 0)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         content.pack_start(body, True, True, 0)
         meta = time_ago(item.time)
@@ -944,20 +1083,43 @@ class Panel(Gtk.Window):
 
     # -- show / hide
 
+    @staticmethod
+    def _monitor_key(monitor):
+        g = monitor.get_geometry()
+        return "%s %d,%d %dx%d" % (monitor.get_model() or "", g.x, g.y, g.width, g.height)
+
+    def _saved_spot(self, monitor):
+        """Where the user last dragged the panel on this monitor, if anywhere."""
+        pos = self.positions.get(self._monitor_key(monitor))
+        if not pos:
+            return None
+        area = monitor.get_workarea()
+        _min, nat = self.get_preferred_size()
+        x = min(max(area.x + pos[0], area.x), area.x + area.width - nat.width)
+        y = min(max(area.y + pos[1], area.y), area.y + area.height - nat.height)
+        return x, y
+
     def _place(self):
+        if WAYLAND:
+            # XWayland does not know where the pointer is, but the compositor
+            # does: left unpositioned, the panel opens on the monitor with the
+            # pointer. _on_map then moves it to the user's spot on that monitor.
+            return
         display = self.get_display()
-        px = py = None
-        if not WAYLAND:   # under XWayland the pointer position is unreliable
-            try:
-                _screen, px, py = display.get_default_seat().get_pointer().get_position()
-            except Exception:
-                px = py = None
+        try:
+            _screen, px, py = display.get_default_seat().get_pointer().get_position()
+        except Exception:
+            px = py = None
         monitor = None
         if px is not None:
             monitor = display.get_monitor_at_point(px, py)
         if monitor is None:
             monitor = display.get_primary_monitor() or display.get_monitor(0)
         if monitor is None:
+            return
+        spot = self._saved_spot(monitor)
+        if spot:
+            self.move(*spot)
             return
         area = monitor.get_workarea()
         _min, nat = self.get_preferred_size()
@@ -969,6 +1131,51 @@ class Panel(Gtk.Window):
             x = min(max(px, area.x), area.x + area.width - w)
             y = min(max(py + 12, area.y), area.y + area.height - h)
         self.move(x, y)
+
+    def _on_map(self, *_):
+        if WAYLAND:
+            GLib.timeout_add(60, self._move_to_saved_spot)
+        return False
+
+    def _move_to_saved_spot(self):
+        window = self.get_window()
+        if window is not None and self.get_visible():
+            monitor = self.get_display().get_monitor_at_window(window)
+            spot = self._saved_spot(monitor) if monitor else None
+            if spot:
+                self.move(*spot)
+        return False
+
+    # -- dragging
+
+    def _on_drag_start(self, _w, event):
+        if event.button != 1 or event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        self._drag_started = time.monotonic()
+        self._track_moves = True
+        self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
+        return True
+
+    def _on_configure(self, *_):
+        if self._track_moves:
+            if self._save_pos_id:
+                GLib.source_remove(self._save_pos_id)
+            self._save_pos_id = GLib.timeout_add(400, self._save_position)
+        return False
+
+    def _save_position(self):
+        self._save_pos_id = 0
+        window = self.get_window()
+        monitor = self.get_display().get_monitor_at_window(window) if window else None
+        if monitor is not None:
+            x, y = self.get_position()
+            area = monitor.get_workarea()
+            self.positions[self._monitor_key(monitor)] = [x - area.x, y - area.y]
+            save_positions(self.positions)
+        return False
+
+    def _on_hide(self, *_):
+        self._track_moves = False
 
     def popup(self, tab="clipboard"):
         for page in self.pages.values():
@@ -1020,8 +1227,9 @@ class Panel(Gtk.Window):
 
     def _on_focus_out(self, *_):
         def check():
+            now = time.monotonic()
             if self.get_visible() and not self.is_active() \
-                    and time.monotonic() - self._shown_at > 0.4:
+                    and now - self._shown_at > 0.4 and now - self._drag_started > 0.6:
                 self.hide()
             return False
         GLib.timeout_add(120, check)

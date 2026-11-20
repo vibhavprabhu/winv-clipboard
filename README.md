@@ -6,7 +6,7 @@
 
 [![Platform](https://img.shields.io/badge/Platform-Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](#-install)
 [![Python](https://img.shields.io/badge/Python_3-GTK_3-3776AB?style=for-the-badge&logo=python&logoColor=white)](#-for-developers)
-[![Version](https://img.shields.io/badge/Version-1.1.0-2ea44f?style=for-the-badge)](dist/)
+[![Version](https://img.shields.io/badge/Version-1.2.0-2ea44f?style=for-the-badge)](dist/)
 
 <a href="https://www.buymeacoffee.com/vibhavprabhu"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
 
@@ -21,8 +21,8 @@
 Debian, Ubuntu, Linux Mint, Pop!_OS, Zorin, elementary:
 
 ```bash
-wget https://github.com/vibhavprabhu/winv-clipboard/raw/main/dist/winv_1.1.0_all.deb
-sudo apt install ./winv_1.1.0_all.deb
+wget https://github.com/vibhavprabhu/winv-clipboard/raw/main/dist/winv_1.2.0_all.deb
+sudo apt install ./winv_1.2.0_all.deb
 winv &          # or just log out and back in: winv starts with your session
 ```
 
@@ -82,6 +82,9 @@ Windows.
 
 On the clipboard tab, **Clear all** removes everything except pinned entries.
 The **…** button on an entry deletes just that one.
+
+The panel opens on the monitor your mouse is on. Drag it by its top bar to put
+it somewhere else; winv remembers that spot separately for each monitor.
 
 ### How the shortcuts are set up
 
@@ -158,7 +161,8 @@ winv --remove-hotkey  undo that
 ```
 
 Pinned entries live in `~/.local/share/winv/` and recently used emoji in
-`~/.config/winv/recent.json`, readable only by you.
+`~/.config/winv/recent.json`, readable only by you. Delete
+`~/.config/winv/position.json` to forget where you dragged the panel.
 
 ---
 
